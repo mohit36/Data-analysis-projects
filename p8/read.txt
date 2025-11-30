@@ -5,152 +5,153 @@ scenario_id,step,country,query,expected_intent,expect_contains,expect_contact_js
 
 2,1,AU,"what do you do?","about","Exigotech",false
 2,2,AU,"tell me about exigotech","about","Exigotech",false
+2,3,AU,"tell me about your company","about","Exigotech",false
 
-3,1,AU,"what services do you offer?","service","service",false
-3,2,AU,"do you provide AI consulting?","service","service",true
-3,3,AU,"do you offer integration help?","service","service",true
+3,1,AU,"what services do you offer?","page","service",false
+3,2,AU,"show me your IT services","page","service",false
 
-4,1,IN,"I want to buy your services","contact","provide your email",false
-4,2,IN,"my email is test@mail.com","contact","provide your phone number",false
-4,3,IN,"+919876543210","contact","contact details",false
+4,1,IN,"show me services","page","service",false
+4,2,IN,"show me cloud services","page","service",false
+4,3,IN,"show me AI services","page","service",true
 
-5,1,SG,"how can I reach your sales team?","contact","provide your email",false
-5,2,SG,"my email is buyer@company.com","contact","provide your phone number",false
-5,3,SG,"91234567","contact","contact details",false
+5,1,SG,"show me solutions","page","service",false
+5,2,SG,"show me more solutions","page","service",true
 
-6,1,PH,"I need implementation help for my business","contact","provide your email",false
-6,2,PH,"email: mech@site.com","contact","provide your phone number",false
-6,3,PH,"phone: 987654321","contact","contact details",false
+6,1,PH,"what solutions do you provide?","page","service",false
+6,2,PH,"show me more services","page","service",true
 
 7,1,AU,"show me blogs","page","blog",false
 7,2,AU,"blog about collaboration","page","blog",false
+7,3,AU,"blog about automation","page","blog",false
 
 8,1,IN,"show me case studies","case","case",false
 8,2,IN,"healthcare case study","case","case",false
+8,3,IN,"manufacturing case study","case","case",false
 
-9,1,SG,"Do you have job openings?","career","career",false
-9,2,SG,"Any openings for software engineer?","career","career",false
+9,1,SG,"do you have case studies?","case","case",false
+9,2,SG,"cloud migration case study","case","case",false
 
-10,1,PH,"Tell me about your company","about","Exigotech",false
+10,1,PH,"any success stories?","case","case",false
+10,2,PH,"AI success story","case","case",false
 
-11,1,AU,"random nonsense asd123","noise","",false
+11,1,AU,"do you have job openings?","career","career",false
+11,2,AU,"show me careers","career","career",false
+11,3,AU,"internship opportunities","career","career",false
 
-12,1,AU,"hi","greeting","",false
-12,2,AU,"hi","greeting","",false
-12,3,AU,"show me services","service","service",true
+12,1,IN,"jobs at exigotech","career","career",false
+12,2,IN,"software engineer position","career","career",false
 
-13,1,IN,"show me jobs","career","career",false
-13,2,IN,"careers page","career","career",false
+13,1,SG,"I want to buy your services","contact","provide your email",false
+13,2,SG,"my email is buyer@company.com","contact","provide your phone number",false
+13,3,SG,"phone 9876543210","contact","contact details",false
 
-14,1,SG,"contact center technologies blog?","contact","provide your email",false
-14,2,SG,"contact center case study?","contact","provide your email",false
+14,1,PH,"can someone from sales contact me?","contact","provide your email",false
+14,2,PH,"email: saleslead@mail.com","contact","provide your phone number",false
+14,3,PH,"+639171234567","contact","contact details",false
 
-15,1,AU,"blog about job automation","page","blog",false
-15,2,AU,"article on collaboration","page","blog",false
+15,1,AU,"I need help with my business","contact","provide your email",false
+15,2,AU,"here is my email biz@mail.com","contact","provide your phone number",false
+15,3,AU,"my number is 0400123456","contact","contact details",false
 
-16,1,IN,"career in case study writing?","career","career",false
+16,1,IN,"can I schedule a demo?","contact","provide your email",false
+16,2,IN,"demo@mail.com","contact","provide your phone number",false
+16,3,IN,"9999988888","contact","contact details",false
 
-17,1,IN,"can someone contact me?","contact","provide your email",false
-17,2,IN,"email: india@mail.com","contact","provide your phone number",false
-17,3,IN,"9876543210","contact","contact details",false
+17,1,SG,"how do I talk to sales?","contact","provide your email",false
+17,2,SG,"email: talk@mail.com","contact","provide your phone number",false
 
-18,1,AU,"I am from Australia, do you operate here?","about","Australia",false
-18,2,AU,"how can I contact your Australia office?","contact","provide your email",false
+18,1,PH,"what is your pricing?","contact","provide your email",false
+18,2,PH,"email pricing@mail.com","contact","provide your phone number",false
 
-19,1,SG,"I am from Singapore, do you serve my region?","about","Singapore",false
+19,1,AU,"support contact","contact","provide your email",false
+19,2,AU,"support@mail.com","contact","provide your phone number",false
 
-20,1,PH,"Do you have an office in Philippines?","about","Philippines",false
-20,2,PH,"how can I contact that office?","contact","provide your email",false
+20,1,IN,"contact your advisor","contact","provide your email",false
+20,2,IN,"lead@mail.com","contact","provide your phone number",false
 
-21,1,AU,"can someone from sales contact me?","contact","provide your email",false
+21,1,AU,"I read your blog on AI","page","blog",false
+21,2,AU,"show me more blogs","page","blog",false
 
 22,1,IN,"show me microsoft collaborations case study","case","case",false
 22,2,IN,"any client success stories?","case","case",false
 
-23,1,SG,"I read your blog on AI","page","blog",false
-23,2,SG,"show me more blogs","page","blog",false
+23,1,SG,"cloud blog","page","blog",false
+23,2,SG,"security blog","page","blog",false
 
-24,1,PH,"show me solutions","service","service",false
-24,2,PH,"show me services for collaboration","service","service",true
+24,1,PH,"healthcare case study","case","case",false
+24,2,PH,"retail case study","case","case",false
 
-25,1,AU,"how do I get pricing?","contact","provide your email",false
-25,2,AU,"my email is lead@mail.com","contact","provide your phone number",false
+25,1,AU,"I am from Australia, do you operate here?","about","Australia",false
+25,2,AU,"do you serve Australian customers?","about","Australia",false
 
-26,1,SG,"what do you do?","about","Exigotech",false
-26,2,SG,"do you build AI solutions?","service","service",false
-26,3,SG,"tell me more services","service","service",true
+26,1,SG,"do you operate in Singapore?","about","Singapore",false
+26,2,SG,"services in Singapore","page","service",false
 
-27,1,IN,"I need help with my business","contact","provide your email",false
+27,1,PH,"do you work in Philippines?","about","Philippines",false
+27,2,PH,"show me your services","page","service",false
 
-28,1,PH,"can I schedule a demo?","contact","provide your email",false
-28,2,PH,"here is my email demo@mail.com","contact","provide your phone number",false
+28,1,IN,"just testing the bot","fallback","",false
 
-29,1,AU,"show me case study healthcare","case","case",false
-29,2,AU,"show me blog healthcare","page","blog",false
+29,1,AU,"hi","greeting","",false
+29,2,AU,"show me services","page","service",false
+29,3,AU,"show me more services","page","service",true
 
-30,1,SG,"support contact","contact","provide your email",false
+30,1,SG,"hello","greeting","",false
+30,2,SG,"what services do you offer?","page","service",false
+30,3,SG,"show me collaboration services","page","service",true
 
-31,1,IN,"I want to talk to sales","contact","provide your email",false
-31,2,IN,"buyer@mail.com","contact","provide your phone number",false
-31,3,IN,"+9112345678","contact","contact details",false
+31,1,PH,"hey","greeting","",false
+31,2,PH,"show me managed IT services","page","service",false
+31,3,PH,"show me AI services","page","service",true
 
-32,1,PH,"hi","greeting","",false
-32,2,PH,"show me services","service","service",false
-32,3,PH,"show me more services","service","service",true
+32,1,IN,"tell me about your leadership","about","Exigotech",false
 
-33,1,AU,"just exploring","greeting","",false
-33,2,AU,"tell me about exigotech","about","Exigotech",false
-33,3,AU,"what services do you offer","service","service",false
-33,4,AU,"show me more services","service","service",true
+33,1,AU,"random asdasd123","fallback","",false
+33,2,AU,"more nonsense text","fallback","",false
 
-34,1,SG,"email: hello@mail.com","contact","provide your phone number",false
-34,2,SG,"phone: 9999999999","contact","contact details",false
+34,1,IN,"career opportunities","career","career",false
+34,2,IN,"graduate roles","career","career",false
 
-35,1,IN,"case study healthcare","case","case",false
-35,2,IN,"blog collaboration","page","blog",false
+35,1,SG,"service overview","page","service",false
+35,2,SG,"detailed services","page","service",true
 
-36,1,PH,"any recent articles?","page","blog",false
+36,1,PH,"show me AI consulting services","page","service",false
+36,2,PH,"show me more AI services","page","service",true
 
-37,1,AU,"show me blogs","page","blog",false
-37,2,AU,"show me case studies","case","case",false
-37,3,AU,"show me services","service","service",true
+37,1,AU,"case study on automation","case","case",false
+37,2,AU,"case study on cybersecurity","case","case",false
 
-38,1,IN,"hi","greeting","",false
-38,2,IN,"what services do you offer?","service","service",false
-38,3,IN,"show me more services","service","service",true
+38,1,IN,"blog about automation","page","blog",false
+38,2,IN,"blog about collaboration","page","blog",false
 
-39,1,SG,"I want implementation help","contact","provide your email",false
+39,1,SG,"how can I get a quote?","contact","provide your email",false
+39,2,SG,"quote@mail.com","contact","provide your phone number",false
 
-40,1,PH,"any way to get a demo?","contact","provide your email",false
-40,2,PH,"my email is demo@site.com","contact","provide your phone number",false
+40,1,PH,"I want to discuss a project","contact","provide your email",false
+40,2,PH,"project@mail.com","contact","provide your phone number",false
 
 41,1,AU,"hi","greeting","",false
-41,2,AU,"hi","greeting","",false
-41,3,AU,"show me services","service","service",false
-41,4,AU,"show me more services","service","service",true
+41,2,AU,"hi again","greeting","",false
+41,3,AU,"show me services","page","service",false
+41,4,AU,"show me more services","page","service",true
 
-42,1,IN,"contact us page","contact","provide your email",false
+42,1,IN,"contact us","contact","provide your email",false
 
-43,1,SG,"job info","career","career",false
-43,2,SG,"internship at Exigotech?","career","career",false
+43,1,SG,"any internship roles?","career","career",false
 
-44,1,PH,"contact center blog","contact","provide your email",false
+44,1,PH,"company overview","about","Exigotech",false
 
-45,1,AU,"who are your partners?","about","Exigotech",false
-45,2,AU,"show me partner case studies","case","case",false
+45,1,AU,"solutions you provide","page","service",false
+45,2,AU,"more solutions","page","service",true
 
-46,1,IN,"do you support Microsoft Teams?","service","service",false
-46,2,IN,"show me MS Teams case study","case","case",false
+46,1,IN,"success story on healthcare","case","case",false
 
-47,1,SG,"I want a quote for AI project","contact","provide your email",false
-47,2,SG,"here is my email: quote@mail.com","contact","provide your phone number",false
+47,1,SG,"case study for banking","case","case",false
 
-48,1,PH,"help me with my business process","contact","provide your email",false
+48,1,PH,"articles on AI","page","blog",false
 
-49,1,AU,"hi","greeting","",false
-49,2,AU,"hi","greeting","",false
-49,3,AU,"do you offer AI services?","service","service",false
-49,4,AU,"show me more services","service","service",true
+49,1,AU,"help me choose a service","page","service",false
+49,2,AU,"show me more options","page","service",true
 
-50,1,IN,"random nonsense text","noise","",false
-50,2,IN,"again random text","noise","",false
+50,1,IN,"pricing for AI solutions","contact","provide your email",false
+50,2,IN,"email: price@mail.com","contact","provide your phone number",false
