@@ -1,288 +1,171 @@
-Yeah, manual clicking is done. If you keep “testing by vibes”, you’ll never know if a change silently broke AU vs SG vs IN vs PH or the contact flow.
+scenario_id,step,country,query,expected_intent,expect_contains,expect_contact_json
+1,1,AU,"hi","greeting","",false
+1,2,AU,"hello","greeting","",false
+1,3,AU,"hey there","greeting","",false
 
-Let’s set up a semi-automated test rig you can actually run.
+2,1,AU,"hi, what do you do?","info","what",false
+2,2,AU,"tell me about exigotech","info","company",false
 
-I’ll give you:
+3,1,AU,"what services do you offer?","service","service",true
+3,2,AU,"do you provide AI consulting?","service","service",true
 
-A tiny change in summarize so you can control country without real IPs.
+4,1,IN,"I want to buy your services","service","service",true
+4,2,IN,"can I get a quote?","service","quote",true
 
-A CSV format for test cases.
+5,1,SG,"how can I reach your sales team?","contact","provide your email",false
+5,2,SG,"my email is buyer@company.com","contact","provide your phone number",false
+5,3,SG,"+6591234567","contact","contact details",false
 
-A Python script that:
+6,1,PH,"I need implementation help for my business","service","service",true
+6,2,PH,"can your team contact me?","contact","provide your email",false
 
-Reads the CSV
+7,1,AU,"show me blogs","blog","blog",false
+7,2,AU,"blog about collaboration","blog","blog",false
 
-Simulates conversations (multi-turn) per scenario
+8,1,IN,"show me case studies","casestudy","case study",false
+8,2,IN,"healthcare case study","casestudy","case study",false
 
-Sends a country override for AU/SG/IN/PH
+9,1,SG,"Do you have job openings?","career","career",false
+9,2,SG,"Any openings for software engineer?","career","career",false
+9,3,SG,"Where do I send my resume?","career","career",false
 
-Prints pass/fail for each step.
+10,1,PH,"Tell me about your company","info","company",false
+10,2,PH,"what does Exigotech do?","info","company",false
 
-You run: python test_runner.py and watch it scream where behaviour is wrong.
+11,1,AU,"asdsadasd?","noise","",false
+11,2,AU,"just testing the bot","noise","",false
 
-1️⃣ Small change in summarize to control country (for tests)
+12,1,AU,"hi","greeting","",false
+12,2,AU,"hi","greeting","",false
+12,3,AU,"hi","greeting","",false
+12,4,AU,"hi","greeting","",false
 
-Right now you do roughly:
+13,1,IN,"show me jobs","career","career",false
+13,2,IN,"careers page","career","career",false
 
-client_ip, override_country = get_client_ip(request)
-client = getattr(request.app.state, "http_client", None)
-country_code = override_country or await get_country_code(client_ip, client) if client else None
+14,1,SG,"contact center technologies blog?","blog","blog",false
+14,2,SG,"contact center case study?","casestudy","case study",false
 
+15,1,PH,"blog about job automation?","blog","blog",false
+15,2,PH,"case study about automation?","casestudy","case study",false
 
-That makes tests depend on real IP → geo API. Nasty.
+16,1,AU,"career in case study writing?","career","career",false
+16,2,AU,"any open positions?","career","career",false
 
-Patch it so tests can override via a header.
+17,1,IN,"I am from India, can someone contact me?","contact","provide your email",false
+17,2,IN,"email: india_user@mail.com","contact","provide your phone number",false
+17,3,IN,"phone 9876543210","contact","contact details",false
 
-Add this near the top of summarize, right after you get sid and log:
-    # --- Country override for testing / routing ---
-    # Priority:
-    # 1) X-Country-Override header (tests)
-    # 2) override_country from get_client_ip (if you already support it)
-    # 3) Geo lookup from IP
-    test_country = request.headers.get("X-Country-Override")
+18,1,AU,"I am from Australia, do you operate here?","info","Australia",false
+18,2,AU,"how can I contact you in Australia?","contact","provide your email",false
 
-    client_ip, override_country = get_client_ip(request)
-    client = getattr(request.app.state, "http_client", None)
+19,1,SG,"I am from Singapore, do you serve my region?","info","Singapore",false
+19,2,SG,"who is the local contact?","contact","provide your email",false
 
-    if test_country:
-        country_code = test_country
-    elif override_country:
-        country_code = override_country
-    elif client:
-        country_code = await get_country_code(client_ip, client)
-    else:
-        country_code = None
+20,1,PH,"Do you have an office in Philippines?","info","Philippines",false
+20,2,PH,"how can I contact that office?","contact","provide your email",false
 
-    location = await get_location_from_ip(client_ip, client) if client else "Unknown"
-    logger.info(
-        "Query received | sid=%s | IP=%s | Location=%s | Country=%s | TestCountry=%s",
-        sid,
-        client_ip,
-        location,
-        country_code,
-        test_country,
-    )
+21,1,AU,"any way to contact your team?","contact","provide your email",false
+21,2,AU,"my email is lead@mail.com","contact","provide your phone number",false
+21,3,AU,"my number is 9988776655","contact","contact details",false
+21,4,AU,"show me blogs","blog","blog",false
 
+22,1,IN,"show me microsoft collaborations case study","casestudy","case study",false
+22,2,IN,"any client success stories?","casestudy","case study",false
 
-Now your tests can force AU/SG/IN/PH without caring about IPs or geo APIs:
+23,1,SG,"I read your blog on AI","blog","blog",false
+23,2,SG,"show me more blogs","blog","blog",false
 
-X-Country-Override: AU
+24,1,PH,"show me solutions","service","service",true
+24,2,PH,"show me services for collaboration","service","service",true
 
-X-Country-Override: SG
+25,1,AU,"how do I get pricing?","service","pricing",true
+25,2,AU,"can someone from sales contact me?","contact","provide your email",false
 
-X-Country-Override: IN
+26,1,SG,"hi","greeting","",false
+26,2,SG,"what do you do?","info","company",false
+26,3,SG,"do you build AI solutions?","service","service",true
 
-X-Country-Override: PH
+27,1,IN,"I need help with my business","service","service",true
+27,2,IN,"do you build custom solutions?","service","service",true
 
-Your existing DB-selection logic using country_code will still work.
+28,1,PH,"can I schedule a demo?","service","service",true
+28,2,PH,"what is your pricing model?","service","pricing",true
 
-2️⃣ CSV format for test cases
+29,1,AU,"show me case study healthcare","casestudy","case study",false
+29,2,AU,"show me blog healthcare","blog","blog",false
 
-Create a file: test_cases.csv in your project root.
+30,1,SG,"support contact","contact","provide your email",false
+30,2,SG,"email: support_user@mail.com","contact","provide your phone number",false
+30,3,SG,"phone: 91234567","contact","contact details",false
 
-Use this header:
+31,1,IN,"I want to talk to sales","contact","provide your email",false
+31,2,IN,"sure, its buyer@mail.com","contact","provide your phone number",false
+31,3,IN,"+911234567890","contact","contact details",false
 
-scenario_id,step,country,query,expect_contains,expect_contact_json
+32,1,PH,"hi","greeting","",false
+32,2,PH,"hi there","greeting","",false
+32,3,PH,"show me services","service","service",true
 
+33,1,AU,"just exploring","noise","",false
+33,2,AU,"tell me about exigotech","info","company",false
+33,3,AU,"what services do you offer?","service","service",true
 
-scenario_id – groups multi-turn conversations (e.g. 1, 1, 1 is one flow)
+34,1,SG,"email: hello@mail.com","contact","email",false
+34,2,SG,"phone: 9999999999","contact","phone",false
 
-step – order inside scenario (1, 2, 3…)
+35,1,IN,"case study healthcare","casestudy","case study",false
+35,2,IN,"blog collaboration","blog","blog",false
 
-country – AU, SG, IN, PH (or blank if you don’t care)
+36,1,PH,"any recent articles?","blog","blog",false
+36,2,PH,"blog about intelligent collaboration","blog","blog",false
 
-query – user message
+37,1,AU,"show me blogs","blog","blog",false
+37,2,AU,"show me case studies","casestudy","case study",false
+37,3,AU,"show me services","service","service",true
 
-expect_contains – substring that should appear in answer (or leave empty)
+38,1,IN,"hi","greeting","",false
+38,2,IN,"hi","greeting","",false
+38,3,IN,"hi","greeting","",false
+38,4,IN,"what services do you offer?","service","service",true
 
-expect_contact_json – true/false if you expect a "contact" key in response JSON
+39,1,SG,"I want implementation help","service","service",true
+39,2,SG,"can someone reach out to me?","contact","provide your email",false
 
-Example content:
+40,1,PH,"any way to get a demo?","service","service",true
+40,2,PH,"can someone show me a demo?","service","service",true
 
-scenario_id,step,country,query,expect_contains,expect_contact_json
-1,1,AU,"hi","",false
-1,2,AU,"what services do you offer?","service",true
+41,1,AU,"hi","greeting","",false
+41,2,AU,"hi","greeting","",false
+41,3,AU,"hi","greeting","",false
+41,4,AU,"hi","greeting","",false
+41,5,AU,"show me services","service","service",true
 
-2,1,AU,"I need to contact your team","provide your email",false
-2,2,AU,"my email is test@mail.com","provide your phone number",false
-2,3,AU,"my phone is 9876543210","contact details",false
+42,1,IN,"contact us page","contact","provide your email",false
+42,2,IN,"can I get your contact details?","contact","provide your email",false
 
-3,1,IN,"show me case studies","case study",false
-3,2,IN,"show me blogs","blog",false
-
-4,1,SG,"hi","",false
-4,2,SG,"hi","",false
-4,3,SG,"hi","",false
-4,4,SG,"hi","",false
+43,1,SG,"job info","career","career",false
+43,2,SG,"internship at Exigotech?","career","career",false
 
+44,1,PH,"contact center blog","blog","blog",false
+44,2,PH,"contact center jobs","career","career",false
 
-You can grow this with all your “services, blogs, careers, contact” variants.
+45,1,AU,"who are your partners?","info","company",false
+45,2,AU,"show me partner case studies","casestudy","case study",false
 
-3️⃣ The semi-automated runner: test_runner.py
+46,1,IN,"do you support Microsoft Teams?","service","service",true
+46,2,IN,"show me MS Teams case study","casestudy","case study",false
 
-Create test_runner.py next to your CSV:
+47,1,SG,"I want a quote for AI project","service","quote",true
+47,2,SG,"can sales call me?","contact","provide your email",false
 
-import csv
-import requests
-from collections import defaultdict
-
-API_URL = "http://localhost:8000/summarize"  # adjust if different
-
-
-def load_test_cases(csv_path: str):
-    scenarios = defaultdict(list)
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            scenario_id = row["scenario_id"].strip()
-            row["step"] = int(row["step"])
-            scenarios[scenario_id].append(row)
+48,1,PH,"help me with my business process","service","service",true
+48,2,PH,"do you offer consulting?","service","service",true
 
-    # sort steps inside each scenario
-    for sid in scenarios:
-        scenarios[sid].sort(key=lambda r: r["step"])
-    return scenarios
+49,1,AU,"hi","greeting","",false
+49,2,AU,"what do you do?","info","company",false
+49,3,AU,"do you offer AI services?","service","service",true
+49,4,AU,"can someone contact me?","contact","provide your email",false
 
-
-def run_scenario(session: requests.Session, scenario_id: str, steps: list[dict]):
-    print(f"\n===== Scenario {scenario_id} =====")
-    all_passed = True
-
-    # new session already has its own cookie jar → one sid per scenario
-
-    for row in steps:
-        country = (row.get("country") or "").strip() or None
-        query = row["query"]
-        expect_contains = (row.get("expect_contains") or "").strip()
-        expect_contact_json = (row.get("expect_contact_json") or "").strip().lower() == "true"
-
-        headers = {}
-        if country:
-            headers["X-Country-Override"] = country  # used in summarize()
-
-        print(f"\nStep {row['step']} | Country={country or '-'}")
-        print(f"User: {query}")
-
-        resp = session.post(API_URL, json={"query": query}, headers=headers)
-        try:
-            resp.raise_for_status()
-        except Exception as e:
-            print(f"❌ HTTP error: {e} (status={resp.status_code})")
-            print("Body:", resp.text[:500])
-            all_passed = False
-            continue
-
-        try:
-            data = resp.json()
-        except Exception:
-            print("❌ Response is not JSON:", resp.text[:500])
-            all_passed = False
-            continue
-
-        # Your API might use "summary" or "raw_answer"
-        answer = data.get("summary") or data.get("raw_answer") or ""
-        contact_field = data.get("contact")
-
-        print(f"Bot: {answer[:200].replace('\\n', ' ')}{'...' if len(answer) > 200 else ''}")
-        print(f"Contact field present? {bool(contact_field)}")
-
-        # Simple checks
-        step_ok = True
-
-        if expect_contains:
-            if expect_contains.lower() not in answer.lower():
-                print(f"❌ Expected answer to contain: '{expect_contains}'")
-                step_ok = False
-            else:
-                print(f"✅ Contains expected text: '{expect_contains}'")
-
-        if expect_contact_json is not None:
-            if bool(contact_field) != expect_contact_json:
-                print(
-                    f"❌ Contact JSON presence mismatch. "
-                    f"Expected: {expect_contact_json}, got: {bool(contact_field)}"
-                )
-                step_ok = False
-            else:
-                print(f"✅ Contact JSON presence matches expected: {expect_contact_json}")
-
-        if step_ok:
-            print("✅ Step PASSED")
-        else:
-            print("❌ Step FAILED")
-            all_passed = False
-
-    return all_passed
-
-
-def main():
-    scenarios = load_test_cases("test_cases.csv")
-    overall_ok = True
-
-    for scenario_id, steps in scenarios.items():
-        # new Session per scenario → new cookie jar → new sid
-        session = requests.Session()
-        scenario_ok = run_scenario(session, scenario_id, steps)
-        if not scenario_ok:
-            overall_ok = False
-
-    print("\n==============================")
-    if overall_ok:
-        print("✅ ALL SCENARIOS PASSED")
-    else:
-        print("❌ Some scenarios FAILED")
-
-
-if __name__ == "__main__":
-    main()
-
-What this does:
-
-Groups rows by scenario_id → each is one conversation.
-
-Uses a new requests.Session() per scenario so cookies (and your sid) persist per flow.
-
-For each step:
-
-Sets X-Country-Override header based on CSV.
-
-Calls /summarize with {"query": ...}.
-
-Reads summary or raw_answer and contact from JSON.
-
-Checks:
-
-Whether expect_contains is a substring of the answer.
-
-Whether contact key exists when expect_contact_json == true.
-
-Prints ✅/❌ per step and per scenario.
-
-That’s your semi-automated rig: you still design expectations, but the system drives the chat and flags mismatches.
-
-How to use it
-
-Apply the small X-Country-Override patch to summarize.
-
-Create test_cases.csv with a few core scenarios:
-
-greetings spam (no contact injection)
-
-1–2 service queries (contact injection expected)
-
-full contact flow (email → phone → done)
-
-blogs/case studies (no contact stuff)
-
-Start your FastAPI app.
-
-Run:
-
-python test_runner.py
-
-
-Watch which steps fail. Use that to debug your intent logic, contact mode, injection, etc.
-
-If you want, next step I can:
-
-Generate a ready-made test_cases.csv file filled with the scenarios we discussed (services, careers, blogs, contact, AU/SG/IN/PH).
+50,1,IN,"random nonsense text","noise","",false
+50,2,IN,"again random text","noise","",false
