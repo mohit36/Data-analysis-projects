@@ -1,403 +1,157 @@
-🔹 Block 0 – New database_operations.py (if you haven’t done it yet)
-Create a new file at project root: database_operations.py:
-# database_operations.py
+🔹 Block 6 – Replace the post-processing part of summarize
+1. Find the OLD block
 
-from typing import List, Dict, Any
-import logging
+In summarize, scroll down to the part after you’ve already:
 
-from pgvector_helper.pgvector_client_connection import get_pgvector_client
+validated the query
 
-logger = logging.getLogger(__name__)
+obtained sid = request.state.session_id
 
+done IP / country detection
 
-async def save_message(session_id: str, role: str, content: str) -> None:
-    """
-    Save a single message into Postgres chat_history.
-    role: "user" or "assistant"
-    """
-    client = await get_pgvector_client()
-    try:
-        await client.execute(
-            """
-            INSERT INTO chat_history (session_id, role, content)
-            VALUES ($1, $2, $3)
-            """,
-            session_id,
-            role,
-            content,
-        )
-    except Exception as e:
-        logger.error("Failed to save message for session %s: %s", session_id, e)
+run hybrid_query_search(...) and have results and raw_answer
 
+Right after that, in your screenshots, you have stuff like:
 
-async def get_recent_history(session_id: str, limit: int = 10) -> List[Dict[str, Any]]:
-    """
-    Fetch last N messages for a session, ordered old -> new.
-    """
-    client = await get_pgvector_client()
-    try:
-        rows = await client.fetch(
-            """
-            SELECT role, content
-            FROM chat_history
-            WHERE session_id = $1
-            ORDER BY created_at DESC
-            LIMIT $2
-            """,
-            session_id,
-            limit,
-        )
-        rows = list(reversed(rows))  # chronological
-        return [{"role": r["role"], "content": r["content"]} for r in rows]
-    except Exception as e:
-        logger.error("Failed to fetch history for session %s: %s", session_id, e)
-        return []
+parsed_json = extract_last_json_object(raw_answer)
+
+# Add user query to session history
+await push_user(sid, query)
+
+# Step 3: If parsed JSON contains contact info, map it to the session
+if parsed_json and "contact" in parsed_json:
+    service_mapping_store.setdefault(sid, {})
+    service_mapping_store[sid]["contact"] = parsed_json["contact"]
+    logger.info("Contact information added to session mapping for sid=%s", sid)
+
+# Step 4: Store the assistant response along with parsed JSON
+if parsed_json:
+    service_mapping_store.setdefault(sid, {})
+    service_mapping_store[sid].update(parsed_json)
+    await push_assistant_sanitized(sid, raw_answer, parsed_json=parsed_json)
+else:
+    await push_assistant_sanitized(sid, raw_answer, parsed_json=None)
+
+# ---- then more “ensure contact in history”, len(get_session_deque(sid)) checks,
+# JSON merging, rebuilding raw_answer, extracting useful links, final return, etc.
 
 
-async def get_msg_count(session_id: str) -> int:
-    """
-    Total messages for a session. Used instead of len(session_deque).
-    """
-    client = await get_pgvector_client()
-    try:
-        row = await client.fetchrow(
-            "SELECT COUNT(*) AS c FROM chat_history WHERE session_id = $1",
-            session_id,
-        )
-        return int(row["c"]) if row else 0
-    except Exception as e:
-        logger.error("Failed to count messages for session %s: %s", session_id, e)
-        return 0
+You’re going to delete everything from parsed_json = extract_last_json_object(raw_answer) down to the final return { "raw_answer": ..., "useful_links": ... }.
 
-You already have the chat_history table SQL from Gemini; that matches this file.
+2. Replace with this NEW block
 
-🔹 Block 1 – Imports + logger setup in chatbot_api.py
-OLD (what you have near the top – approximate)
-Look for something like this around lines 1–30:
-from collections import deque
-from contextlib import asynccontextmanager
-import json
-import os
-import logging
-from datetime import datetime
-from typing import Any, Dict, Optional, Tuple, Set, Deque
-from dotenv import load_dotenv
-from fastapi import FastAPI, Request
-from pydantic import BaseModel
-import httpx
-from starlette.responses import JSONResponse, Response
-import asyncio
-import time
-import uuid
-import re
-import hashlib
+Paste this in its place (indent to match inside summarize):
 
-# project-specific imports (keep as-is)
-from pgvector_helper.pgvector_client_connection import get_pgvector_client
-from pgvector_helper.db_logger import setup_postgres_logger
-from chatbot_agents.chatbot_search_new import hybrid_query_search, SearchAgent
-from api_handler.rate_limit_middleware import add_rate_limit_middleware
-...
+    # --------------------------------------------------
+    # Post-processing: JSON, mapping, history, contact nudge
+    # --------------------------------------------------
 
-NEW (replace that whole imports section with this)
-from collections import deque
-from contextlib import asynccontextmanager
-import json
-import os
-import logging
-from datetime import datetime
-from typing import Any, Dict, Optional, Tuple, Set, Deque
+    # Try to parse the last JSON object from the answer (relevant services, etc.)
+    parsed_json = extract_last_json_object(raw_answer)
 
-from dotenv import load_dotenv
-from fastapi import FastAPI, Request
-from pydantic import BaseModel
-import httpx
-from starlette.responses import JSONResponse, Response
-import asyncio
-import time
-import uuid
-import re
-import hashlib
+    # 1) Persist user message to DB
+    await push_user(sid, query)
 
-# project-specific imports
-from db_logger import get_db_logger
-from database_operations import save_message, get_recent_history, get_msg_count
-
-from chatbot_agents.chatbot_search_new import hybrid_query_search, SearchAgent
-from api_handler.rate_limit_middleware import add_rate_limit_middleware
-# (keep any other project-specific imports you already have)
-
-Immediately after the imports, add this once:
-logger = get_db_logger(__name__)
-
-If you already had a logger = logging.getLogger("chatbot_api"), kill it. This new one is the single source.
-
-🔹 Block 2 – Remove old DB logger setup in lifespan
-In your screenshots, inside @asynccontextmanager async def lifespan(app: FastAPI): you have “Step 1: attach DB logger” using setup_postgres_logger(...).
-OLD (rough)
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Step 1: attach DB logger
-    t1 = time.perf_counter()
-    try:
-        setup_postgres_logger(
-            conn_factory=get_pgvector_client,
-            table_name="app_logs",
-            batch_size=100,
-            flush_interval=1.0,
-        )
-        logger = logging.getLogger("chatbot_api")
-        logger.info("DB logger attached in %.3f seconds", time.perf_counter() - t1,
-                    extra={"service": "api"})
-    except Exception as e:
-        logging.getLogger("chatbot_api").error(
-            "DB logger setup failed: %s", e, extra={"service": "api"}
+    # 2) Update mapping store if JSON already has contact payload
+    if isinstance(parsed_json, dict) and "contact" in parsed_json:
+        service_mapping_store.setdefault(sid, {})
+        service_mapping_store[sid]["contact"] = parsed_json["contact"]
+        logger.info(
+            "Contact information found in JSON for sid=%s", sid,
+            extra={"service": "api"}
         )
 
-    # Step 2: create shared httpx AsyncClient
-    t0 = time.perf_counter()
-    app.state.http_client = httpx.AsyncClient(
-        limits=httpx.Limits(max_keepalive_connections=20, max_connections=200)
-    )
-    logger.info("httpx client created in %.3f seconds", time.perf_counter() - t0,
-                extra={"service": "api"})
-    ...
+    # 3) Persist assistant message to DB (text only)
+    await push_assistant_sanitized(sid, raw_answer, parsed_json=parsed_json)
 
-NEW (replace only the logger part, keep HTTP client and rest)
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Step 1: you can log startup time if you want
-    start = time.perf_counter()
-    logger.info("chatbot_api lifespan starting", extra={"service": "api"})
+    # 4) Get up-to-date message count from DB (user + assistant included)
+    msg_count = await get_msg_count(sid)
 
-    # Step 2: create shared httpx AsyncClient
-    t0 = time.perf_counter()
-    app.state.http_client = httpx.AsyncClient(
-        limits=httpx.Limits(max_keepalive_connections=20, max_connections=200)
-    )
-    logger.info(
-        "httpx client created in %.3f seconds",
-        time.perf_counter() - t0,
-        extra={"service": "api"},
-    )
+    # 5) Contact nudge logic: only after enough turns AND if contact not already present
+    if msg_count > 4:  # threshold: adjust if you want
+        needs_contact = not (isinstance(parsed_json, dict) and "contact" in parsed_json)
 
-    # (keep your placeholder / other warm-up code if any)
+        if needs_contact:
+            contact_payload = {
+                "contact": "How can I contact Exigotech sales team?"
+            }
 
-    try:
-        yield
-    finally:
-        t1 = time.perf_counter()
-        try:
-            await app.state.http_client.aclose()
+            # Ensure we have a dict to work with
+            if not isinstance(parsed_json, dict):
+                parsed_json = {}
+
+            parsed_json.update(contact_payload)
+
+            # Update mapping store as well
+            service_mapping_store.setdefault(sid, {})
+            service_mapping_store[sid]["contact"] = parsed_json["contact"]
+
             logger.info(
-                "httpx client closed in %.3f seconds",
-                time.perf_counter() - t1,
+                "Injected contact payload for sid=%s (msg_count=%s)",
+                sid,
+                msg_count,
                 extra={"service": "api"},
             )
-        except Exception as e:
-            logger.error(
-                "httpx client close failed: %s", e, extra={"service": "api"}
-            )
 
-The key: no setup_postgres_logger anywhere in this file.
+            # Rebuild raw_answer so the updated JSON is reflected in the text
+            try:
+                # Common pattern: "... \n\nrelevant services:\n{json}"
+                parts = raw_answer.split("relevant services:")
+                prefix = parts[0].rstrip()
+                raw_answer = (
+                    f"{prefix}\n\nrelevant services:\n"
+                    f"{json.dumps(parsed_json, ensure_ascii=False)}"
+                )
+            except Exception:
+                # Fallback: append JSON at the end
+                raw_answer = (
+                    f"{raw_answer.rstrip()}\n\nrelevant services:\n"
+                    f"{json.dumps(parsed_json, ensure_ascii=False)}"
+                )
 
-🔹 Block 3 – Kill RAM session history and replace helpers
-Find this block (your screenshot around line ~220):
-# Session memory store (in-memory)
-service_mapping_store: Dict[str, Dict[str, Any]] = {}
-session_history_store: Dict[str, Deque[Dict[str, Any]]] = {}
-session_locks: Dict[str, asyncio.Lock] = {}
+    # 6) Extract useful links from results
+    result_urls = _extract_result_urls(results)
+    useful_links = list(result_urls)[:5]
 
-def _get_or_create_lock(sid: str) -> asyncio.Lock:
-    ...
-
-def _get_session_deque(sid: str) -> Deque[Dict[str, Any]]:
-    ...
-
-async def get_history_snapshot(sid: str) -> list[Dict[str, Any]]:
-    lock = _get_or_create_lock(sid)
-    async with lock:
-        return list(_get_session_deque(sid))
-
-async def push_user(sid: str, query: str):
-    ...
-
-async def push_assistant_sanitized(...):
-    ...
-
-NEW (replace that whole block with this)
-# ------------------------------
-# Session / mapping
-# ------------------------------
-
-# Mapping store still in RAM for now (button -> underlying question etc.)
-service_mapping_store: Dict[str, Dict[str, Any]] = {}
-
-# Chat history itself is now stored in Postgres (chat_history table).
+    # 7) Final response
+    return {
+        "raw_answer": raw_answer,
+        "useful_links": useful_links,
+    }
 
 
-# ------------------------------
-# History helpers (DB-backed)
-# ------------------------------
+What this does:
 
-async def get_history_snapshot(sid: str) -> list[Dict[str, Any]]:
-    """
-    Return recent chat history for a session from Postgres.
-    Keeps the old signature so existing calls still work.
-    """
-    if not sid:
-        return []
-    return await get_recent_history(sid, limit=10)
+Single place where history is written → push_user, push_assistant_sanitized → Postgres.
 
+msg_count comes from DB, not RAM.
 
-async def push_user(sid: str, query: str) -> None:
-    """
-    Store the user message in Postgres.
-    """
-    if not sid or not query:
-        return
-    await save_message(sid, "user", query)
+Contact JSON injection is done once, cleanly, when:
 
+there are enough messages (msg_count > 4), and
 
-async def push_assistant_sanitized(
-    sid: str,
-    sanitized_text: str,
-    parsed_json: Optional[Dict[str, str]] = None,
-) -> None:
-    """
-    Store the assistant message in Postgres.
+there is no "contact" key already.
 
-    We only persist the visible text; any parsed_json used for buttons/contact
-    is still handled in the summarize() logic and returned to the frontend.
-    """
-    if not sid or not sanitized_text:
-        return
-    await save_message(sid, "assistant", sanitized_text)
+service_mapping_store[sid]["contact"] is always updated whenever contact is present (either from the model or injected).
 
-Important: don’t touch the other functions below (like extract_last_json_object, lookup_mapped_question, _extract_result_urls, etc.). They’re not about history.
+raw_answer is rebuilt consistently so your frontend still sees the "relevant services:\n{...json...}" pattern it already depends on.
 
-🔹 Block 4 – Replace history length checks with DB counts
-You currently have several places that do things like:
-
-
-“if history length > 2, add contact JSON”
-
-
-“if history length > X, ensure contact in history”
-
-
-Those use len(_get_session_deque(sid)) or similar.
-Step 4.1 – At the top of summarize(...)
-Find your summarize definition; it looks like this in the screenshot:
-@app.post("/summarize")
-async def summarize(payload: SummarizeRequest, request: Request) -> Dict[str, Any]:
-    query = payload.query.strip()
-    ...
-    sid = request.state.session_id
-    ...
-
-Add a DB-based message count right after you resolve sid:
-    sid = request.state.session_id
-
-    # Total messages so far for this session (DB-backed)
-    msg_count = await get_msg_count(sid)
-
-Step 4.2 – Replace len(history) conditions
-Now search in chatbot_api.py for any of these patterns:
-
-
-len(_get_session_deque(sid))
-
-
-len(get_session_deque(sid))
-
-
-or anything like if len(dq) >= 3 where dq is the session deque
-
-
-Replace them with checks on msg_count.
-Example 1 – near the bottom of summarize, where you currently inject contact info into history:
-# OLD
-if len(_get_session_deque(sid)) > 2:
-    contact_json = {"contact": "How can I contact Exigotech sales team?"}
-    if isinstance(parsed_json, dict):
-        parsed_json.update(contact_json)
-    ...
-
-→
-# NEW
-if msg_count > 2:
-    contact_json = {"contact": "How can I contact Exigotech sales team?"}
-    if isinstance(parsed_json, dict):
-        parsed_json.update(contact_json)
-    ...
-
-Example 2 – if ensure_contact_in_history uses history length:
-async def ensure_contact_in_history(sid: str) -> None:
-    logger.info("Contact information added to history for sid=%s", sid)
-    # OLD:
-    # if len(_get_session_deque(sid)) <= 2:
-    #     return
-
-    msg_count = await get_msg_count(sid)
-    if msg_count <= 2:
-        return
-
-    # keep the rest of the logic as-is (contact mapping, etc.)
-
-Point is simple: anyplace you rely on “conversation length” must now use get_msg_count, not RAM.
-
-🔹 Block 5 – Make /log-smoke use get_db_logger
-At the bottom you have:
-@app.get("/log-smoke")
-async def log_smoke():
-    lg = logging.getLogger("app.test")
-    lg.info("smoke test info", extra={"request_id": "smoke-1", "service": "api"})
-    lg.error("smoke test error", extra={"request_id": "smoke-2", "service": "api"})
-    return {"status": "logged"}
-
-Change it to:
-@app.get("/log-smoke")
-async def log_smoke():
-    lg = get_db_logger("app.test")
-    lg.info("smoke test info", extra={"request_id": "smoke-1", "service": "api"})
-    lg.error("smoke test error", extra={"request_id": "smoke-2", "service": "api"})
-    return {"status": "logged"}
-
-That guarantees this endpoint tests the new db_logger, not old handlers.
+Links are extracted at the end, no duplicate logic.
 
 What you do now
-You wanted concrete, block-by-block. Here’s your sequence:
 
+In summarize, delete from parsed_json = extract_last_json_object(raw_answer) down to the final return {...}.
 
-Apply Block 0 (if not done): create database_operations.py.
+Paste the NEW block above in that spot.
 
+Save, run the app.
 
-Apply Block 1 + Block 2 in chatbot_api.py.
+Do a short manual test:
 
+Hit /summarize 1–2 times → confirm no contact button yet.
 
-Apply Block 3 (history helper replacement).
+Hit it enough times to exceed the msg_count > 4 threshold → confirm the contact option JSON appears and mapping still works.
 
+Check chat_history table → user + assistant rows are stored.
 
-Apply Block 4 (switch all history-length logic to msg_count).
-
-
-Apply Block 5 (/log-smoke fix).
-
-
-Then:
-
-
-Run migrations (if needed) so chat_history exists.
-
-
-Start your app.
-
-
-Hit /log-smoke → verify rows appear in your system_logs table (or whatever db_logger writes to).
-
-
-Have a multi-turn chat via /summarize → check chat_history table; confirm rows are being inserted and msg_count matches reality.
-
-
-If you hit a specific error, paste the traceback + the exact code around that line, and we’ll fix that block next.
+When that’s done and working, say “next” again and we’ll tackle the next cleanup (e.g., trimming any now-dead helper functions and tightening the mapping logic).
