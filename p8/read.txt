@@ -1,77 +1,44 @@
-    agent = SearchAgent()
-    query_intent = await agent.classify_query_type(query)
-    logger.info("Query intent classified: %s", query_intent)
-
-    # 6) Contact / lead capture flow (email + phone) with state
-    detected_email = extract_email(query)
-    detected_phone = extract_phone(query)
-
-    # update per-session contact state
-    contact_state = update_contact_state(sid, detected_email, detected_phone)
-    email_in_state = contact_state.get("email")
-    phone_in_state = contact_state.get("phone")
-
-    # If this turn explicitly looks like a contact query, start/stay in contact mode
-    if isinstance(query_intent, str) and query_intent.lower() == "contact":
-        contact_state["mode"] = "contact"
-    if "contact" in query.lower():
-        contact_state["mode"] = "contact"
-
-    # We are in contact flow if the mode flag is set
-    is_contact_flow = contact_state.get("mode") == "contact"
-
-    results: list[Any] = []
-    raw_answer: str
-
-    if is_contact_flow:
-        # ---- Explicit contact flow: NO RAG ----
-        if not email_in_state:
-            # 1) No email yet -> ask for email
-            raw_answer = "Can you please provide your email address?"
-            results = []
-        elif not phone_in_state:
-            # 2) Have email, no phone yet -> ask for phone
-            raw_answer = (
-                f"Thank you for providing your email: {email_in_state}. "
-                "Please provide your phone number."
+        if msg_count > 4:
+            needs_contact = not (
+                isinstance(parsed_json, dict) and "contact" in parsed_json
             )
-            results = []
-        else:
-            # 3) Have both email and phone -> confirm and end
-            raw_answer = (
-                "Thank you for providing your contact details.\n"
-                f"- Email: {email_in_state}\n"
-                f"- Phone: {phone_in_state}\n\n"
-                "Our team will contact you shortly."
-            )
-            results = []
-            # Mark flow as done so future questions don't get stuck in contact mode
-            contact_state["mode"] = "done"
 
-    else:
-        # ---- Normal RAG / search flow ----
-        session_history_snapshot = await get_history_snapshot(sid)
+            if needs_contact:
+                contact_payload = {
+                    "contact": "How can I contact Exigotech sales team?"
+                }
 
-        query, results = await hybrid_query_search(
-            query,
-            session_history_snapshot,
-            top_k=10,
-            request_url=str(request.url),
-            country_code=country_code,
-        )
+                # Ensure we have a dict to work with
+                if not isinstance(parsed_json, dict):
+                    parsed_json = {}
 
-        if not results:
-            return {
-                "raw_answer": "No results found for your query.",
-                "useful_links": [],
-            }
+                parsed_json.update(contact_payload)
 
-        # Optionally re-classify intent on refined query
-        query_intent = await agent.classify_query_type(query)
-        logger.info("Query intent re-classified: %s", query_intent)
+                # Update mapping store as well
+                service_mapping_store.setdefault(sid, {})
+                service_mapping_store[sid]["contact"] = parsed_json["contact"]
 
-        raw_answer = await generate_exigotech_answer(
-            chunks=results[:5],
-            query=query,
-            intent=query_intent,
-        )
+                logger.info(
+                    "Injected contact payload for sid=%s (msg_count=%s)",
+                    sid,
+                    msg_count,
+                    extra={"service": "api"},
+                )
+
+                # ---- Rebuild raw_answer with EXACTLY ONE "Relevant services" block ----
+                # Do a case-insensitive search for 'relevant services:'
+                lower_text = raw_answer.lower()
+                marker = "relevant services:"
+                idx = lower_text.find(marker)
+
+                if idx != -1:
+                    # Strip everything from the existing marker onwards
+                    prefix = raw_answer[:idx].rstrip()
+                else:
+                    # No existing block, keep full text as prefix
+                    prefix = raw_answer.rstrip()
+
+                raw_answer = (
+                    f"{prefix}\n\nRelevant services:\n"
+                    f"{json.dumps(parsed_json, ensure_ascii=False)}"
+                )
