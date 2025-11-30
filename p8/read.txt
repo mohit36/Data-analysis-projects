@@ -1,44 +1,15 @@
-        if msg_count > 4:
-            needs_contact = not (
-                isinstance(parsed_json, dict) and "contact" in parsed_json
-            )
+agent = SearchAgent()
+query_intent = await agent.classify_query_type(query)
+logger.info("Query intent classified: %s", query_intent)
 
-            if needs_contact:
-                contact_payload = {
-                    "contact": "How can I contact Exigotech sales team?"
-                }
+# --- Track business-oriented intent for contact injection ---
+business_intents = {
+    "service", "contact", "sales", "pricing", "buy", "business", "quote", "demo"
+}
 
-                # Ensure we have a dict to work with
-                if not isinstance(parsed_json, dict):
-                    parsed_json = {}
+state = service_mapping_store.setdefault(sid, {})
+business_count = state.get("business_count", 0)
 
-                parsed_json.update(contact_payload)
-
-                # Update mapping store as well
-                service_mapping_store.setdefault(sid, {})
-                service_mapping_store[sid]["contact"] = parsed_json["contact"]
-
-                logger.info(
-                    "Injected contact payload for sid=%s (msg_count=%s)",
-                    sid,
-                    msg_count,
-                    extra={"service": "api"},
-                )
-
-                # ---- Rebuild raw_answer with EXACTLY ONE "Relevant services" block ----
-                # Do a case-insensitive search for 'relevant services:'
-                lower_text = raw_answer.lower()
-                marker = "relevant services:"
-                idx = lower_text.find(marker)
-
-                if idx != -1:
-                    # Strip everything from the existing marker onwards
-                    prefix = raw_answer[:idx].rstrip()
-                else:
-                    # No existing block, keep full text as prefix
-                    prefix = raw_answer.rstrip()
-
-                raw_answer = (
-                    f"{prefix}\n\nRelevant services:\n"
-                    f"{json.dumps(parsed_json, ensure_ascii=False)}"
-                )
+if isinstance(query_intent, str) and query_intent.lower() in business_intents:
+    business_count += 1
+    state["business_count"] = business_count
