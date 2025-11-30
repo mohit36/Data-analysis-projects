@@ -1,15 +1,57 @@
-agent = SearchAgent()
-query_intent = await agent.classify_query_type(query)
-logger.info("Query intent classified: %s", query_intent)
+        # 4) Reload message count from DB after writing this turn
+        msg_count = await get_msg_count(sid)
 
-# --- Track business-oriented intent for contact injection ---
-business_intents = {
-    "service", "contact", "sales", "pricing", "buy", "business", "quote", "demo"
-}
+        # --- Business-intent–based contact injection ---
+        state = service_mapping_store.setdefault(sid, {})
+        business_count = state.get("business_count", 0)
+        in_contact_flow = state.get("mode") == "contact"
 
-state = service_mapping_store.setdefault(sid, {})
-business_count = state.get("business_count", 0)
+        # We inject only if:
+        # - user is NOT already in explicit contact flow
+        # - there's no contact key yet in parsed_json
+        # - and they've shown clear business intent
+        needs_contact = (
+            not in_contact_flow
+            and (not isinstance(parsed_json, dict) or "contact" not in parsed_json)
+        )
 
-if isinstance(query_intent, str) and query_intent.lower() in business_intents:
-    business_count += 1
-    state["business_count"] = business_count
+        if needs_contact:
+            # Early injection if this session has at least 2 business-style queries,
+            # OR (if you still want msg_count as a secondary guard) msg_count > 4.
+            if business_count >= 2 or msg_count > 8:
+                contact_payload = {
+                    "contact": "How can I contact Exigotech sales team?"
+                }
+
+                if not isinstance(parsed_json, dict):
+                    parsed_json = {}
+
+                parsed_json.update(contact_payload)
+
+                state["contact"] = parsed_json["contact"]
+
+                logger.info(
+                    "Injected contact payload for sid=%s (business_count=%s, msg_count=%s)",
+                    sid,
+                    business_count,
+                    msg_count,
+                    extra={"service": "api"},
+                )
+
+                # If you're still rebuilding 'Relevant services', do it here.
+                # If you removed raw_answer and just use 'answer', adjust accordingly.
+                # Example using 'answer' (no double relevant services):
+
+                lower_text = answer.lower()
+                marker = "relevant services:"
+                idx = lower_text.find(marker)
+
+                if idx != -1:
+                    prefix = answer[:idx].rstrip()
+                else:
+                    prefix = answer.rstrip()
+
+                answer = (
+                    f"{prefix}\n\nRelevant services:\n"
+                    f"{json.dumps(parsed_json, ensure_ascii=False)}"
+                )
