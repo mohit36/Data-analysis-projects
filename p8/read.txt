@@ -1,147 +1,288 @@
-Yes. And you should, otherwise you’re just eyeballing behaviour and hoping.
+Yeah, manual clicking is done. If you keep “testing by vibes”, you’ll never know if a change silently broke AU vs SG vs IN vs PH or the contact flow.
 
-Let’s make this concrete. There are 3 levels you can use today:
+Let’s set up a semi-automated test rig you can actually run.
 
-1️⃣ Simple Manual Test Matrix (start here)
+I’ll give you:
 
-Make a table (in Notion/Excel/Google Sheets) with columns like:
+A tiny change in summarize so you can control country without real IPs.
 
-#
+A CSV format for test cases.
 
-user_input
+A Python script that:
 
-expected_intent (greeting / service / contact / blog / casestudy / career / other)
+Reads the CSV
 
-expected_contact_mode (none / contact / done)
+Simulates conversations (multi-turn) per scenario
 
-expected_business_count_change (0 or +1)
+Sends a country override for AU/SG/IN/PH
 
-expect_contact_injection (yes/no)
+Prints pass/fail for each step.
 
-notes
+You run: python test_runner.py and watch it scream where behaviour is wrong.
 
-You already asked for lots of questions; convert them into rows.
+1️⃣ Small change in summarize to control country (for tests)
 
-Example rows:
+Right now you do roughly:
 
-#	user_input	expected_intent	contact_mode	business_count_change	expect_contact_injection
-1	hi	greeting	none	0	no
-2	what services do you offer?	service	none	+1	yes (after 2nd service)
-3	how can I reach your sales team?	contact	contact	+1	no (in explicit flow)
-4	sure, my email is test@mail.com
-	contact	contact	0	no
-5	my phone is 9876543210	contact	done	0	no
+client_ip, override_country = get_client_ip(request)
+client = getattr(request.app.state, "http_client", None)
+country_code = override_country or await get_country_code(client_ip, client) if client else None
 
-Use it as a checklist while you click through the UI.
 
-2️⃣ CSV + small checker script (semi-automated)
+That makes tests depend on real IP → geo API. Nasty.
 
-If you want something more serious but still lightweight:
+Patch it so tests can override via a header.
 
-a) Make a test_cases.csv (text file)
+Add this near the top of summarize, right after you get sid and log:
+    # --- Country override for testing / routing ---
+    # Priority:
+    # 1) X-Country-Override header (tests)
+    # 2) override_country from get_client_ip (if you already support it)
+    # 3) Geo lookup from IP
+    test_country = request.headers.get("X-Country-Override")
+
+    client_ip, override_country = get_client_ip(request)
+    client = getattr(request.app.state, "http_client", None)
+
+    if test_country:
+        country_code = test_country
+    elif override_country:
+        country_code = override_country
+    elif client:
+        country_code = await get_country_code(client_ip, client)
+    else:
+        country_code = None
+
+    location = await get_location_from_ip(client_ip, client) if client else "Unknown"
+    logger.info(
+        "Query received | sid=%s | IP=%s | Location=%s | Country=%s | TestCountry=%s",
+        sid,
+        client_ip,
+        location,
+        country_code,
+        test_country,
+    )
+
+
+Now your tests can force AU/SG/IN/PH without caring about IPs or geo APIs:
+
+X-Country-Override: AU
+
+X-Country-Override: SG
+
+X-Country-Override: IN
+
+X-Country-Override: PH
+
+Your existing DB-selection logic using country_code will still work.
+
+2️⃣ CSV format for test cases
+
+Create a file: test_cases.csv in your project root.
+
+Use this header:
+
+scenario_id,step,country,query,expect_contains,expect_contact_json
+
+
+scenario_id – groups multi-turn conversations (e.g. 1, 1, 1 is one flow)
+
+step – order inside scenario (1, 2, 3…)
+
+country – AU, SG, IN, PH (or blank if you don’t care)
+
+query – user message
+
+expect_contains – substring that should appear in answer (or leave empty)
+
+expect_contact_json – true/false if you expect a "contact" key in response JSON
 
 Example content:
 
-id,input,expected_intent,expect_contact_mode,expect_contact_field
-1,"hi","greeting","none",false
-2,"what services do you offer?","service","none",true
-3,"how can I reach your sales team?","contact","contact",false
-4,"sure, my email is test@mail.com","contact","contact",false
-5,"my phone is 9876543210","contact","done",false
-6,"show me blogs","blog","none",false
-7,"show me case studies","casestudy","none",false
+scenario_id,step,country,query,expect_contains,expect_contact_json
+1,1,AU,"hi","",false
+1,2,AU,"what services do you offer?","service",true
+
+2,1,AU,"I need to contact your team","provide your email",false
+2,2,AU,"my email is test@mail.com","provide your phone number",false
+2,3,AU,"my phone is 9876543210","contact details",false
+
+3,1,IN,"show me case studies","case study",false
+3,2,IN,"show me blogs","blog",false
+
+4,1,SG,"hi","",false
+4,2,SG,"hi","",false
+4,3,SG,"hi","",false
+4,4,SG,"hi","",false
 
 
-You can expand this with all the scenarios we listed.
+You can grow this with all your “services, blogs, careers, contact” variants.
 
-b) Tiny Python script to call your /summarize and log behaviour
+3️⃣ The semi-automated runner: test_runner.py
 
-Assuming your API is running at http://localhost:8000/summarize:
+Create test_runner.py next to your CSV:
 
 import csv
-import httpx
+import requests
+from collections import defaultdict
 
-API_URL = "http://localhost:8000/summarize"
+API_URL = "http://localhost:8000/summarize"  # adjust if different
 
-def main():
-    session = httpx.Client()  # will reuse cookies -> same sid
 
-    with open("test_cases.csv", newline="", encoding="utf-8") as f:
+def load_test_cases(csv_path: str):
+    scenarios = defaultdict(list)
+    with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            user_input = row["input"]
-            print(f"\n=== Test {row['id']} ===")
-            print(f"User: {user_input}")
+            scenario_id = row["scenario_id"].strip()
+            row["step"] = int(row["step"])
+            scenarios[scenario_id].append(row)
 
-            resp = session.post(API_URL, json={"query": user_input})
+    # sort steps inside each scenario
+    for sid in scenarios:
+        scenarios[sid].sort(key=lambda r: r["step"])
+    return scenarios
+
+
+def run_scenario(session: requests.Session, scenario_id: str, steps: list[dict]):
+    print(f"\n===== Scenario {scenario_id} =====")
+    all_passed = True
+
+    # new session already has its own cookie jar → one sid per scenario
+
+    for row in steps:
+        country = (row.get("country") or "").strip() or None
+        query = row["query"]
+        expect_contains = (row.get("expect_contains") or "").strip()
+        expect_contact_json = (row.get("expect_contact_json") or "").strip().lower() == "true"
+
+        headers = {}
+        if country:
+            headers["X-Country-Override"] = country  # used in summarize()
+
+        print(f"\nStep {row['step']} | Country={country or '-'}")
+        print(f"User: {query}")
+
+        resp = session.post(API_URL, json={"query": query}, headers=headers)
+        try:
             resp.raise_for_status()
+        except Exception as e:
+            print(f"❌ HTTP error: {e} (status={resp.status_code})")
+            print("Body:", resp.text[:500])
+            all_passed = False
+            continue
+
+        try:
             data = resp.json()
+        except Exception:
+            print("❌ Response is not JSON:", resp.text[:500])
+            all_passed = False
+            continue
 
-            # Your API might use "raw_answer" or "summary" – handle both:
-            answer = data.get("summary") or data.get("raw_answer") or ""
-            contact_field = data.get("contact")
+        # Your API might use "summary" or "raw_answer"
+        answer = data.get("summary") or data.get("raw_answer") or ""
+        contact_field = data.get("contact")
 
-            print(f"Bot: {answer}")
-            print(f"Contact field present? {bool(contact_field)} "
-                  f"(expected: {row['expect_contact_field']})")
+        print(f"Bot: {answer[:200].replace('\\n', ' ')}{'...' if len(answer) > 200 else ''}")
+        print(f"Contact field present? {bool(contact_field)}")
+
+        # Simple checks
+        step_ok = True
+
+        if expect_contains:
+            if expect_contains.lower() not in answer.lower():
+                print(f"❌ Expected answer to contain: '{expect_contains}'")
+                step_ok = False
+            else:
+                print(f"✅ Contains expected text: '{expect_contains}'")
+
+        if expect_contact_json is not None:
+            if bool(contact_field) != expect_contact_json:
+                print(
+                    f"❌ Contact JSON presence mismatch. "
+                    f"Expected: {expect_contact_json}, got: {bool(contact_field)}"
+                )
+                step_ok = False
+            else:
+                print(f"✅ Contact JSON presence matches expected: {expect_contact_json}")
+
+        if step_ok:
+            print("✅ Step PASSED")
+        else:
+            print("❌ Step FAILED")
+            all_passed = False
+
+    return all_passed
+
+
+def main():
+    scenarios = load_test_cases("test_cases.csv")
+    overall_ok = True
+
+    for scenario_id, steps in scenarios.items():
+        # new Session per scenario → new cookie jar → new sid
+        session = requests.Session()
+        scenario_ok = run_scenario(session, scenario_id, steps)
+        if not scenario_ok:
+            overall_ok = False
+
+    print("\n==============================")
+    if overall_ok:
+        print("✅ ALL SCENARIOS PASSED")
+    else:
+        print("❌ Some scenarios FAILED")
+
 
 if __name__ == "__main__":
     main()
 
+What this does:
 
-This doesn’t assert yet, it just prints mismatches so you can see:
+Groups rows by scenario_id → each is one conversation.
 
-Where contact shows up when it shouldn’t
+Uses a new requests.Session() per scenario so cookies (and your sid) persist per flow.
 
-Where contact injection is missing when it should exist
+For each step:
 
-You can later turn those prints into assert calls if you want a proper test run.
+Sets X-Country-Override header based on CSV.
 
-3️⃣ Deeper: unit-ish tests for the classifier / injection logic
+Calls /summarize with {"query": ...}.
 
-If you’re serious:
+Reads summary or raw_answer and contact from JSON.
 
-Pull your intent classification and contact injection into small pure functions (no FastAPI, no DB).
+Checks:
 
-Write pytest tests that call them directly with strings and your fake state dict, and assert:
+Whether expect_contains is a substring of the answer.
 
-what business_count becomes,
+Whether contact key exists when expect_contact_json == true.
 
-what mode becomes (contact / done),
+Prints ✅/❌ per step and per scenario.
 
-whether injection happens or not.
+That’s your semi-automated rig: you still design expectations, but the system drives the chat and flags mismatches.
 
-Example pattern:
+How to use it
 
-def test_greeting_does_not_increment_business():
-    state = {}
-    intent = "greeting"
-    new_state = apply_business_intent_state(state, intent)
-    assert new_state.get("business_count", 0) == 0
+Apply the small X-Country-Override patch to summarize.
 
-def test_service_increments_business():
-    state = {}
-    intent = "service"
-    new_state = apply_business_intent_state(state, intent)
-    assert new_state["business_count"] == 1
+Create test_cases.csv with a few core scenarios:
+
+greetings spam (no contact injection)
+
+1–2 service queries (contact injection expected)
+
+full contact flow (email → phone → done)
+
+blogs/case studies (no contact stuff)
+
+Start your FastAPI app.
+
+Run:
+
+python test_runner.py
 
 
-But that requires you to have that logic factored out. Right now it’s buried inside summarize. If you want, we can refactor that next.
+Watch which steps fail. Use that to debug your intent logic, contact mode, injection, etc.
 
-Pragmatic answer
+If you want, next step I can:
 
-Given where you are:
-
-Do this now:
-
-Make the CSV (or sheet).
-
-Use the small Python script to drive your API and log behaviour.
-
-Once it stabilises and you’re not fighting basic bugs, then we can refactor out the intent/injection logic and slap proper unit tests on it.
-
-If you want, I can:
-
-Generate a bigger test_cases.csv for you pre-filled with all the service/contact/blog/career/casestudy examples we discussed.
-
-Or turn this into a Streamlit test harness where you click “Run all tests” and see pass/fail.
+Generate a ready-made test_cases.csv file filled with the scenarios we discussed (services, careers, blogs, contact, AU/SG/IN/PH).
