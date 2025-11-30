@@ -1,697 +1,216 @@
-Alright, here’s the deal: you’ve hacked this file enough times that it’s become a Frankenstein. I’m going to give you **all the relevant changes** we’ve discussed in a **structured OLD → NEW pattern**, block by block, so you can systematically clean it up.
-
-You’ll touch **two files**:
-
-1. `database_operations.py` (new / full file)
-2. `chatbot_api.py` (patches)
-
----
-
-## 0️⃣ `database_operations.py` – full file (no “old” here)
-
-Create or replace `database_operations.py` with this EXACT content:
-
-```python
-# database_operations.py
-
-from __future__ import annotations
-
-import asyncio
-import logging
-from typing import Any, Dict, List, Optional
-
-from pgvector_helper.pgvector_client_connection import get_pgvector_client
-
-logger = logging.getLogger(__name__)
-
-
-# ------------ Internal helper to run blocking psycopg2 code in a thread ------------
-
-async def _run_db(
-    sql: str,
-    params: tuple[Any, ...] = (),
-    fetch: bool = False,
-    fetch_one: bool = False,
-) -> Optional[Any]:
-    """
-    Execute a blocking psycopg2 query in a threadpool so it doesn't block the event loop.
-    - sql: SQL string with %s placeholders
-    - params: parameters tuple
-    - fetch: if True, fetchall()
-    - fetch_one: if True, fetchone()
-    """
-    loop = asyncio.get_running_loop()
-
-    def _execute():
-        conn = None
-        try:
-            conn = get_pgvector_client()  # sync psycopg2 connection
-            with conn.cursor() as cur:
-                cur.execute(sql, params)
-
-                if fetch_one:
-                    row = cur.fetchone()
-                elif fetch:
-                    row = cur.fetchall()
-                else:
-                    row = None
-
-            conn.commit()
-            return row
-        except Exception as e:
-            logger.error("DB error in _run_db: %s", e)
-            if conn is not None:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-            raise
-
-    return await loop.run_in_executor(None, _execute)
-
-
-# ---------------- Public API used by chatbot_api.py ----------------
-
-
-async def save_message(session_id: str, role: str, content: str) -> None:
-    """
-    Save a single message into Postgres chat_history.
-    role should be 'user' or 'assistant'.
-    """
-    try:
-        await _run_db(
-            """
-            INSERT INTO chat_history (session_id, role, content)
-            VALUES (%s, %s, %s)
-            """,
-            (session_id, role, content),
-            fetch=False,
-        )
-    except Exception as e:
-        logger.error("Failed to save message for session %s: %s", session_id, e)
-
-
-async def get_recent_history(session_id: str, limit: int = 10) -> List[Dict[str, Any]]:
-    """
-    Fetch last N messages for a session, ordered old -> new.
-    """
-    try:
-        rows = await _run_db(
-            """
-            SELECT role, content
-            FROM chat_history
-            WHERE session_id = %s
-            ORDER BY created_at DESC
-            LIMIT %s
-            """,
-            (session_id, limit),
-            fetch=True,
-        ) or []
-
-        rows = list(reversed(rows))  # chronological: oldest first
-        return [{"role": r[0], "content": r[1]} for r in rows]
-    except Exception as e:
-        logger.error("Failed to fetch history for session %s: %s", session_id, e)
-        return []
-
-
-async def get_msg_count(session_id: str) -> int:
-    """
-    Total messages for a session. Used instead of len(session_deque).
-    """
-    try:
-        row = await _run_db(
-            "SELECT COUNT(*) FROM chat_history WHERE session_id = %s",
-            (session_id,),
-            fetch_one=True,
-        )
-        if not row:
-            return 0
-        return int(row[0])
-    except Exception as e:
-        logger.error("Failed to count messages for session %s: %s", session_id, e)
-        return 0
-```
-
----
-
-## 1️⃣ `chatbot_api.py` – IMPORTS + LOGGER
-
-### OLD (top of file – approximate)
-
-```python
-from collections import deque
-from contextlib import asynccontextmanager
-import json
-import os
-import logging
-from datetime import datetime
-from typing import Any, Dict, Optional, Tuple, Set, Deque
-
-from dotenv import load_dotenv
-from fastapi import FastAPI, Request
-from pydantic import BaseModel
-import httpx
-from starlette.responses import JSONResponse, Response
-import asyncio
-import time
-import uuid
-import re
-import hashlib
-
-# project-specific imports (keep as-is)
-from pgvector_helper.pgvector_client_connection import get_pgvector_client
-from pgvector_helper.db_logger import setup_postgres_logger
-from chatbot_agents.chatbot_search_new import hybrid_query_search, SearchAgent
-from api_handler.rate_limit_middleware import add_rate_limit_middleware
-...
-```
-
-### NEW (replace that whole import block)
-
-```python
-from collections import deque
-from contextlib import asynccontextmanager
-import json
-import os
-import logging
-from datetime import datetime
-from typing import Any, Dict, Optional, Tuple, Set, Deque
-
-from dotenv import load_dotenv
-from fastapi import FastAPI, Request
-from pydantic import BaseModel
-import httpx
-from starlette.responses import JSONResponse, Response
-import asyncio
-import time
-import uuid
-import re
-import hashlib
-
-# project-specific imports
-from db_logger import get_db_logger
-from database_operations import save_message, get_recent_history, get_msg_count
-
-from chatbot_agents.chatbot_search_new import hybrid_query_search, SearchAgent
-from api_handler.rate_limit_middleware import add_rate_limit_middleware
-# ...keep the rest of your project-specific imports
-```
-
-Immediately after imports:
-
-### NEW (add this once)
-
-```python
-logger = get_db_logger(__name__)
-```
-
-Delete any old `logger = logging.getLogger("chatbot_api")` etc.
-
----
-
-## 2️⃣ `lifespan` – remove old DB logger setup
-
-### OLD (inside `@asynccontextmanager lifespan`)
-
-```python
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Step 1: attach DB logger
-    t1 = time.perf_counter()
-    try:
-        setup_postgres_logger(
-            conn_factory=get_pgvector_client,
-            table_name="app_logs",
-            batch_size=100,
-            flush_interval=1.0,
-        )
-        logger = logging.getLogger("chatbot_api")
-        logger.info("DB logger attached in %.3f seconds", time.perf_counter() - t1,
-                    extra={"service": "api"})
-    except Exception as e:
-        logging.getLogger("chatbot_api").error(
-            "DB logger setup failed: %s", e, extra={"service": "api"}
-        )
-
-    # Step 2: create shared httpx AsyncClient
-    t0 = time.perf_counter()
-    app.state.http_client = httpx.AsyncClient(
-        limits=httpx.Limits(max_keepalive_connections=20, max_connections=200)
-    )
-    logger.info("httpx client created in %.3f seconds", time.perf_counter() - t0,
-                extra={"service": "api"})
-    ...
-```
-
-### NEW (replace the whole body of `lifespan` with this)
-
-```python
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Log startup
-    start = time.perf_counter()
-    logger.info("chatbot_api lifespan starting", extra={"service": "api"})
-
-    # Shared HTTP client
-    t0 = time.perf_counter()
-    app.state.http_client = httpx.AsyncClient(
-        limits=httpx.Limits(max_keepalive_connections=20, max_connections=200)
-    )
-    logger.info(
-        "httpx client created in %.3f seconds",
-        time.perf_counter() - t0,
-        extra={"service": "api"},
-    )
-
-    try:
-        # Place for other warmup if you need it
-        yield
-    finally:
-        t1 = time.perf_counter()
-        try:
-            await app.state.http_client.aclose()
-            logger.info(
-                "httpx client closed in %.3f seconds",
-                time.perf_counter() - t1,
-                extra={"service": "api"},
-            )
-        except Exception as e:
-            logger.error(
-                "httpx client close failed: %s",
-                e,
-                extra={"service": "api"},
-            )
-```
-
----
-
-## 3️⃣ Middleware wiring – make sure it exists
-
-You **should already** have something like:
-
-```python
-app = FastAPI(lifespan=lifespan)
-add_rate_limit_middleware(app)
-app.add_middleware(SessionMiddlewareImpl)
-```
-
-If `app.add_middleware(SessionMiddlewareImpl)` is missing, add it back. Otherwise sessions won’t persist.
-
----
-
-## 4️⃣ Session / mapping + helpers
-
-Find your in-memory globals and RAM helpers.
-
-### OLD (approx)
-
-```python
-# Session memory store (in-memory)
-service_mapping_store: Dict[str, Dict[str, Any]] = {}
-session_history_store: Dict[str, Deque[Dict[str, Any]]] = {}
-session_locks: Dict[str, asyncio.Lock] = {}
-
-def _get_or_create_lock(sid: str) -> asyncio.Lock:
-    ...
-def _get_session_deque(sid: str) -> Deque[Dict[str, Any]]:
-    ...
-def _set_session_deque(sid: str, dq: Deque[Dict[str, Any]]) -> None:
-    ...
-async def get_history_snapshot(sid: str) -> list[Dict[str, Any]]:
-    ...
-async def push_user(...):
-    ...
-async def push_assistant_sanitized(...):
-    ...
-```
-
-### NEW (replace that entire region with this)
-
-```python
-# ------------------------------
-# Session / mapping
-# ------------------------------
-
-# Mapping store still in RAM for now (button -> underlying question etc.)
-service_mapping_store: Dict[str, Dict[str, Any]] = {}
-
-
-def get_contact_state(sid: str) -> Dict[str, Any]:
-    """
-    Per-session storage for contact details (email / phone, etc.).
-    Reuses the existing service_mapping_store so we don't create new globals.
-    """
-    return service_mapping_store.setdefault(sid, {})
-
-
-def update_contact_state(
-    sid: str,
-    email: Optional[str],
-    phone: Optional[str],
-) -> Dict[str, Any]:
-    state = service_mapping_store.setdefault(sid, {})
-    if email:
-        state["email"] = email
-    if phone:
-        state["phone"] = phone
-    return state
-
-
-# ------------------------------
-# History helpers (DB-backed)
-# ------------------------------
-
-async def get_history_snapshot(sid: str) -> list[Dict[str, Any]]:
-    """
-    Return recent chat history for a session from Postgres.
-    Keeps the old signature so existing calls still work.
-    """
-    if not sid:
-        return []
-    return await get_recent_history(sid, limit=10)
-
-
-async def push_user(sid: str, query: str) -> None:
-    """
-    Store the user message in Postgres.
-    """
-    if not sid or not query:
-        return
-    await save_message(sid, "user", query)
-
-
-async def push_assistant_sanitized(
-    sid: str,
-    sanitized_text: str,
-    parsed_json: Optional[Dict[str, Any]] = None,
-) -> None:
-    """
-    Store the assistant message in Postgres.
-
-    We only persist the visible text; any parsed_json used for buttons/contact
-    is still handled in the summarize() logic and returned to the frontend.
-    """
-    if not sid or not sanitized_text:
-        return
-    await save_message(sid, "assistant", sanitized_text)
-```
-
-And you **DELETE** `ensure_contact_in_history`, `_get_or_create_lock`, `_get_session_deque`, `_set_session_deque`, and any calls to them.
-
----
-
-## 5️⃣ `summarize` – session ID block (SID + logging)
-
-### OLD
-
-```python
 @app.post("/summarize")
 async def summarize(payload: SummarizeRequest, request: Request) -> Dict[str, Any]:
-    query = payload.query.strip()
-    if not query:
-        return JSONResponse(status_code=400, content={"error": "query is required"})
+    try:
+        # 0) Basic validation
+        query = payload.query.strip()
+        if not query:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "query is required"},
+            )
 
-    sid = request.state.session_id
-    if not sid:
-        return JSONResponse(status_code=500, content={"error": "Session unavailable"})
-```
+        # 1) Session handling
+        sid = getattr(request.state, "session_id", None)
+        if not sid:
+            sid = str(uuid.uuid4())
+            logger.warning(
+                "No session_id found on request.state; generated fallback sid=%s",
+                sid,
+                extra={"service": "api"},
+            )
 
-### NEW (replace the start of `summarize` with this)
-
-```python
-@app.post("/summarize")
-async def summarize(payload: SummarizeRequest, request: Request) -> Dict[str, Any]:
-    query = payload.query.strip()
-    if not query:
-        return JSONResponse(status_code=400, content={"error": "query is required"})
-
-    # --- Session handling ---
-    # Try to read the session id set by SessionMiddlewareImpl.
-    sid = getattr(request.state, "session_id", None)
-
-    # Fallback: if middleware failed or cookie not sent, generate a new one
-    if not sid:
-        sid = str(uuid.uuid4())
-        logger.warning(
-            "No session_id found on request.state; generated fallback sid=%s",
+        logger.info(
+            "summarize called with sid=%s",
             sid,
             extra={"service": "api"},
         )
 
-    # Log every call with its sid so we can verify stability across requests
-    logger.info(
-        "summarize called with sid=%s",
-        sid,
-        extra={"service": "api"},
-    )
-```
+        # 2) DB-based message count (used later for contact nudge)
+        msg_count = await get_msg_count(sid)
 
-Keep the rest of the function after this block.
+        # 3) Lookup for mapped query (e.g., contact mapping)
+        mapped_question = lookup_mapped_question(sid, query)
+        if mapped_question:
+            logger.info("Phase B mapping hit: %s -> %s", query, mapped_question)
+            query = mapped_question  # use mapped query
+            # DO NOT reset service_mapping_store here – it now holds contact state
 
----
+        # 4) IP / geo info
+        client_ip, override_country = get_client_ip(request)
+        client = getattr(request.app.state, "httpx_client", None)
+        country_code = override_country
+        if not country_code and client:
+            country_code = await get_country_code(client_ip, client)
 
-## 6️⃣ `summarize` – stateful contact/email/phone flow
-
-Find your current “contact us / email / phone” handling inside `summarize`. It’ll have some combination of:
-
-* `extract_email(query)`
-* `extract_phone(query)`
-* `query_intent == "contact"` or `"contact" in query.lower()`
-* and a bunch of `if not email: "please provide email"` / `elif not phone: ...`.
-
-### OLD (conceptual)
-
-```python
-email = extract_email(query)
-phone = extract_phone(query)
-
-if query_intent == "contact" or "contact" in query.lower():
-    if not email:
-        raw_answer = "Can you please provide your email address?"
-        results = []
-    elif not phone:
-        raw_answer = f"Thank you for providing your email: {email}. Please provide your phone number."
-        results = []
-    else:
-        raw_answer = "Thank you for providing your details..."
-        results = []
-    # maybe still calls hybrid_query_search / more logic
-```
-
-### NEW (replace that whole contact block with this)
-
-Put this **after** you’ve computed `query_intent` and `sid`, and **before** you call `hybrid_query_search`:
-
-```python
-    # -------------------------
-    # Contact / lead capture flow (email + phone) with state
-    # -------------------------
-    # Detect email/phone in THIS message
-    detected_email = extract_email(query)
-    detected_phone = extract_phone(query)
-
-    # Update per-session contact state
-    contact_state = update_contact_state(sid, detected_email, detected_phone)
-
-    email_in_state = contact_state.get("email")
-    phone_in_state = contact_state.get("phone")
-
-    # Decide if this turn is part of a "contact us" flow
-    is_contact_intent = False
-    if query_intent and isinstance(query_intent, str):
-        is_contact_intent = query_intent.lower() == "contact"
-    if "contact" in query.lower():
-        is_contact_intent = True
-
-    if is_contact_intent:
-        # 1) No email yet -> ask for email
-        if not email_in_state:
-            raw_answer = "Can you please provide your email address?"
-            results = []
-        # 2) Have email, no phone yet -> ask for phone
-        elif not phone_in_state:
-            raw_answer = (
-                f"Thank you for providing your email: {email_in_state}. "
-                "Please provide your phone number."
-            )
-            results = []
-        # 3) Have both email and phone -> confirm and end flow
-        else:
-            raw_answer = (
-                "Thank you for providing your contact details.\n"
-                f"- Email: {email_in_state}\n"
-                f"- Phone: {phone_in_state}\n\n"
-                "Our team will contact you shortly."
-            )
-            results = []
-
-        # Skip RAG search for explicit contact flow.
-        # Let the function continue into the common post-processing below:
-        # parsed_json = extract_last_json_object(raw_answer)
-        # await push_user(...)
-        # await push_assistant_sanitized(...)
-        # etc.
-
-    else:
-        # -------- normal RAG / search flow --------
-        history = await get_history_snapshot(sid)
-        # (whatever contextualization you had)
-        contextualized = query  # or your existing contextualize_query(...)
-        results = await hybrid_query_search(contextualized)
-        # your normal answer generation
-        raw_answer = results.get("answer") if isinstance(results, dict) else str(results)
-```
-
-You may have a more complex contextualization/answer generation pipeline — fine, keep that in the `else` block.
-
----
-
-## 7️⃣ `summarize` – unified post-processing (history + JSON + contact nudge)
-
-Now replace everything from:
-
-```python
-parsed_json = extract_last_json_object(raw_answer)
-# Add user to history...
-# push_user, push_assistant...
-# len(get_session_deque...) checks...
-# ensure_contact_in_history...
-# JSON merge logic...
-# extract_result_urls...
-# return {...}
-```
-
-with this **single clean block**:
-
-```python
-    # --------------------------------------------------
-    # Post-processing: JSON, mapping, history, contact nudge
-    # --------------------------------------------------
-
-    # Try to parse the last JSON object from the answer (relevant services, etc.)
-    parsed_json = extract_last_json_object(raw_answer)
-
-    # 1) Persist user message to DB
-    await push_user(sid, query)
-
-    # 2) Update mapping store if JSON already has contact payload
-    if isinstance(parsed_json, dict) and "contact" in parsed_json:
-        service_mapping_store.setdefault(sid, {})
-        service_mapping_store[sid]["contact"] = parsed_json["contact"]
+        location = await get_location_from_ip(client_ip, client) if client else "Unknown"
         logger.info(
-            "Contact information found in JSON for sid=%s", sid,
-            extra={"service": "api"}
+            "Query received | sid=%s | IP=%s | Location=%s",
+            sid,
+            client_ip,
+            location,
         )
 
-    # 3) Persist assistant message to DB (text only)
-    await push_assistant_sanitized(sid, raw_answer, parsed_json=parsed_json)
+        # 5) First-pass intent classification
+        agent = SearchAgent()
+        query_intent = await agent.classify_query_type(query)
+        logger.info("Query intent classified: %s", query_intent)
 
-    # 4) Get up-to-date message count from DB (user + assistant included)
-    msg_count = await get_msg_count(sid)
+        # 6) Contact / lead capture flow (email + phone) with state
+        detected_email = extract_email(query)
+        detected_phone = extract_phone(query)
 
-    # 5) Contact nudge logic: only after enough turns AND if contact not already present
-    if msg_count > 4:
-        needs_contact = not (isinstance(parsed_json, dict) and "contact" in parsed_json)
+        # update per-session contact state
+        contact_state = update_contact_state(sid, detected_email, detected_phone)
+        email_in_state = contact_state.get("email")
+        phone_in_state = contact_state.get("phone")
 
-        if needs_contact:
-            contact_payload = {
-                "contact": "How can I contact Exigotech sales team?"
-            }
+        # Is this part of a "contact us" flow?
+        is_contact_intent = False
+        if isinstance(query_intent, str) and query_intent.lower() == "contact":
+            is_contact_intent = True
+        if "contact" in query.lower():
+            is_contact_intent = True
 
-            if not isinstance(parsed_json, dict):
-                parsed_json = {}
+        results: list[Any] = []
+        raw_answer: str
 
-            parsed_json.update(contact_payload)
+        if is_contact_intent:
+            # ---- Explicit contact flow: no RAG ----
+            if not email_in_state:
+                # 1) No email yet -> ask for email
+                raw_answer = "Can you please provide your email address?"
+                results = []
+            elif not phone_in_state:
+                # 2) Have email, no phone yet -> ask for phone
+                raw_answer = (
+                    f"Thank you for providing your email: {email_in_state}. "
+                    "Please provide your phone number."
+                )
+                results = []
+            else:
+                # 3) Have both email and phone -> confirm and end
+                raw_answer = (
+                    "Thank you for providing your contact details.\n"
+                    f"- Email: {email_in_state}\n"
+                    f"- Phone: {phone_in_state}\n\n"
+                    "Our team will contact you shortly."
+                )
+                results = []
 
+        else:
+            # ---- Normal RAG / search flow ----
+            session_history_snapshot = await get_history_snapshot(sid)
+
+            # your existing hybrid_query_search signature:
+            # (query, session_history_snapshot, top_k=10, request_url, country_code)
+            query, results = await hybrid_query_search(
+                query,
+                session_history_snapshot,
+                top_k=10,
+                request_url=str(request.url),
+                country_code=country_code,
+            )
+
+            if not results:
+                return {
+                    "raw_answer": "No results found for your query.",
+                    "useful_links": [],
+                }
+
+            # Optionally re-classify intent on refined query
+            query_intent = await agent.classify_query_type(query)
+            logger.info("Query intent re-classified: %s", query_intent)
+
+            # Your existing answer generator
+            raw_answer = await generate_exigotech_answer(
+                chunks=results[:5],
+                query=query,
+                intent=query_intent,
+            )
+
+        # --------------------------------------------------
+        # 7) Post-processing: JSON, mapping, history, contact nudge
+        # --------------------------------------------------
+
+        # Try to parse the last JSON object from the answer (relevant services, etc.)
+        parsed_json = extract_last_json_object(raw_answer)
+
+        # 1) Persist user message to DB
+        await push_user(sid, query)
+
+        # 2) Update mapping store if JSON already has contact payload
+        if isinstance(parsed_json, dict) and "contact" in parsed_json:
             service_mapping_store.setdefault(sid, {})
             service_mapping_store[sid]["contact"] = parsed_json["contact"]
-
             logger.info(
-                "Injected contact payload for sid=%s (msg_count=%s)",
+                "Contact information found in JSON for sid=%s",
                 sid,
-                msg_count,
                 extra={"service": "api"},
             )
 
-            # Rebuild raw_answer so the updated JSON is reflected in the text
-            try:
-                parts = raw_answer.split("relevant services:")
-                prefix = parts[0].rstrip()
-                raw_answer = (
-                    f"{prefix}\n\nrelevant services:\n"
-                    f"{json.dumps(parsed_json, ensure_ascii=False)}"
+        # 3) Persist assistant message to DB (text only)
+        await push_assistant_sanitized(sid, raw_answer, parsed_json=parsed_json)
+
+        # 4) Reload message count from DB after writing this turn
+        msg_count = await get_msg_count(sid)
+
+        # 5) Contact nudge logic: only after enough turns AND if contact not already present
+        if msg_count > 4:
+            needs_contact = not (
+                isinstance(parsed_json, dict) and "contact" in parsed_json
+            )
+
+            if needs_contact:
+                contact_payload = {
+                    "contact": "How can I contact Exigotech sales team?"
+                }
+
+                # Ensure we have a dict to work with
+                if not isinstance(parsed_json, dict):
+                    parsed_json = {}
+
+                parsed_json.update(contact_payload)
+
+                # Update mapping store as well
+                service_mapping_store.setdefault(sid, {})
+                service_mapping_store[sid]["contact"] = parsed_json["contact"]
+
+                logger.info(
+                    "Injected contact payload for sid=%s (msg_count=%s)",
+                    sid,
+                    msg_count,
+                    extra={"service": "api"},
                 )
-            except Exception:
-                raw_answer = (
-                    f"{raw_answer.rstrip()}\n\nrelevant services:\n"
-                    f"{json.dumps(parsed_json, ensure_ascii=False)}"
-                )
 
-    # 6) Extract useful links from results
-    result_urls = _extract_result_urls(results)
-    useful_links = list(result_urls)[:5]
+                # Rebuild raw_answer so the updated JSON is reflected in the text
+                try:
+                    # Typical pattern: "... \n\nrelevant services:\n{json}"
+                    parts = raw_answer.split("relevant services:")
+                    prefix = parts[0].rstrip()
+                    raw_answer = (
+                        f"{prefix}\n\nrelevant services:\n"
+                        f"{json.dumps(parsed_json, ensure_ascii=False)}"
+                    )
+                except Exception:
+                    # Fallback: append JSON at the end
+                    raw_answer = (
+                        f"{raw_answer.rstrip()}\n\nrelevant services:\n"
+                        f"{json.dumps(parsed_json, ensure_ascii=False)}"
+                    )
 
-    # 7) Final response
-    return {
-        "raw_answer": raw_answer,
-        "useful_links": useful_links,
-    }
-```
+        # 6) Extract useful links from results
+        result_urls = _extract_result_urls(results)
+        useful_links = list(result_urls)[:5]
 
-This is where **all history writing happens** and where the contact nudge is injected.
+        # 7) Final response
+        return {
+            "raw_answer": raw_answer,
+            "useful_links": useful_links,
+        }
 
----
-
-## 8️⃣ `/log-smoke` – make sure it uses `get_db_logger`
-
-### OLD
-
-```python
-@app.get("/log-smoke")
-async def log_smoke():
-    lg = logging.getLogger("app.test")
-    lg.info("smoke test info", extra={"request_id": "smoke-1", "service": "api"})
-    lg.error("smoke test error", extra={"request_id": "smoke-2", "service": "api"})
-    return {"status": "logged"}
-```
-
-### NEW
-
-```python
-@app.get("/log-smoke")
-async def log_smoke():
-    lg = get_db_logger("app.test")
-    lg.info("smoke test info", extra={"request_id": "smoke-1", "service": "api"})
-    lg.error("smoke test error", extra={"request_id": "smoke-2", "service": "api"})
-    return {"status": "logged"}
-```
-
----
-
-## What you do now (no shortcuts)
-
-1. **Replace** `database_operations.py` with the full file above.
-
-2. Apply each `chatbot_api.py` block **in order**: imports, lifespan, globals, SID block, contact flow, post-processing, log-smoke.
-
-3. Make sure there are **no remaining references** to:
-
-   * `_get_or_create_lock`, `_get_session_deque`, `_set_session_deque`
-   * `session_history_store`, `session_locks`
-   * `ensure_contact_in_history`
-   * `pgvector_helper.session_memory_pgvector`
-
-4. Run the app and test:
-
-   * `/log-smoke` → check logs land in DB.
-   * Normal chat flow:
-
-     * Ask general questions → check `chat_history` rows grow; contact nudge appears only after enough turns.
-   * Contact flow:
-
-     * “any contact for them?” → email prompt.
-     * Provide email → phone prompt.
-     * Provide phone → final confirmation (no loop).
-
-If something still breaks, I want **the exact traceback** and the **exact lines** it points to. No more “no luck” — we fix concrete failures.
+    except Exception as e:
+        logger.exception("summarize failed: %s", e)
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Internal error"},
+        )
