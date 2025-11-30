@@ -134,6 +134,58 @@ async def chat_endpoint(request: Request):
             "payload": "How can I contact the Exigotech Sales Team?" 
             # ^^^ The Payload IS the question. No mapping needed.
         })
+        Step 1: Replace db_logger.py with this:
+
+Python
+
+import logging
+import asyncio
+from pgvector_helper.pgvector_client_connection import get_pgvector_client
+
+class SimpleDBHandler(logging.Handler):
+    def emit(self, record):
+        # Don't log DB errors to DB (infinite loop)
+        if "pgvector" in record.name: 
+            return
+
+        msg = self.format(record)
+        # Fire and forget
+        asyncio.create_task(self.write_log(record.levelname, record.module, msg))
+
+    async def write_log(self, level, module, message):
+        try:
+            client = await get_pgvector_client()
+            await client.execute(
+                "INSERT INTO app_logs (level, module, message) VALUES ($1, $2, $3)",
+                level, module, message
+            )
+        except Exception:
+            # Fallback to console if DB fails
+            print(f"DB LOG FAIL: {message}")
+
+def get_db_logger(name):
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    
+    # 1. Console Handler (Always works)
+    c_handler = logging.StreamHandler()
+    c_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logger.addHandler(c_handler)
+
+    # 2. DB Handler (Async)
+    db_handler = SimpleDBHandler()
+    db_handler.setFormatter(logging.Formatter('%(message)s'))
+    logger.addHandler(db_handler)
+    
+    return logger
+Step 2: Update chatbot_api.py
+
+Python
+
+from db_logger import get_db_logger
+
+# Replace your old logger setup with this one line
+logger = get_db_logger(__name__)
 
     # 7. Return Structured JSON (Frontend renders buttons from 'options')
     return {
