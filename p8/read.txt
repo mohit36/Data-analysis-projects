@@ -1,57 +1,147 @@
-        # 4) Reload message count from DB after writing this turn
-        msg_count = await get_msg_count(sid)
+Yes. And you should, otherwise you’re just eyeballing behaviour and hoping.
 
-        # --- Business-intent–based contact injection ---
-        state = service_mapping_store.setdefault(sid, {})
-        business_count = state.get("business_count", 0)
-        in_contact_flow = state.get("mode") == "contact"
+Let’s make this concrete. There are 3 levels you can use today:
 
-        # We inject only if:
-        # - user is NOT already in explicit contact flow
-        # - there's no contact key yet in parsed_json
-        # - and they've shown clear business intent
-        needs_contact = (
-            not in_contact_flow
-            and (not isinstance(parsed_json, dict) or "contact" not in parsed_json)
-        )
+1️⃣ Simple Manual Test Matrix (start here)
 
-        if needs_contact:
-            # Early injection if this session has at least 2 business-style queries,
-            # OR (if you still want msg_count as a secondary guard) msg_count > 4.
-            if business_count >= 2 or msg_count > 8:
-                contact_payload = {
-                    "contact": "How can I contact Exigotech sales team?"
-                }
+Make a table (in Notion/Excel/Google Sheets) with columns like:
 
-                if not isinstance(parsed_json, dict):
-                    parsed_json = {}
+#
 
-                parsed_json.update(contact_payload)
+user_input
 
-                state["contact"] = parsed_json["contact"]
+expected_intent (greeting / service / contact / blog / casestudy / career / other)
 
-                logger.info(
-                    "Injected contact payload for sid=%s (business_count=%s, msg_count=%s)",
-                    sid,
-                    business_count,
-                    msg_count,
-                    extra={"service": "api"},
-                )
+expected_contact_mode (none / contact / done)
 
-                # If you're still rebuilding 'Relevant services', do it here.
-                # If you removed raw_answer and just use 'answer', adjust accordingly.
-                # Example using 'answer' (no double relevant services):
+expected_business_count_change (0 or +1)
 
-                lower_text = answer.lower()
-                marker = "relevant services:"
-                idx = lower_text.find(marker)
+expect_contact_injection (yes/no)
 
-                if idx != -1:
-                    prefix = answer[:idx].rstrip()
-                else:
-                    prefix = answer.rstrip()
+notes
 
-                answer = (
-                    f"{prefix}\n\nRelevant services:\n"
-                    f"{json.dumps(parsed_json, ensure_ascii=False)}"
-                )
+You already asked for lots of questions; convert them into rows.
+
+Example rows:
+
+#	user_input	expected_intent	contact_mode	business_count_change	expect_contact_injection
+1	hi	greeting	none	0	no
+2	what services do you offer?	service	none	+1	yes (after 2nd service)
+3	how can I reach your sales team?	contact	contact	+1	no (in explicit flow)
+4	sure, my email is test@mail.com
+	contact	contact	0	no
+5	my phone is 9876543210	contact	done	0	no
+
+Use it as a checklist while you click through the UI.
+
+2️⃣ CSV + small checker script (semi-automated)
+
+If you want something more serious but still lightweight:
+
+a) Make a test_cases.csv (text file)
+
+Example content:
+
+id,input,expected_intent,expect_contact_mode,expect_contact_field
+1,"hi","greeting","none",false
+2,"what services do you offer?","service","none",true
+3,"how can I reach your sales team?","contact","contact",false
+4,"sure, my email is test@mail.com","contact","contact",false
+5,"my phone is 9876543210","contact","done",false
+6,"show me blogs","blog","none",false
+7,"show me case studies","casestudy","none",false
+
+
+You can expand this with all the scenarios we listed.
+
+b) Tiny Python script to call your /summarize and log behaviour
+
+Assuming your API is running at http://localhost:8000/summarize:
+
+import csv
+import httpx
+
+API_URL = "http://localhost:8000/summarize"
+
+def main():
+    session = httpx.Client()  # will reuse cookies -> same sid
+
+    with open("test_cases.csv", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            user_input = row["input"]
+            print(f"\n=== Test {row['id']} ===")
+            print(f"User: {user_input}")
+
+            resp = session.post(API_URL, json={"query": user_input})
+            resp.raise_for_status()
+            data = resp.json()
+
+            # Your API might use "raw_answer" or "summary" – handle both:
+            answer = data.get("summary") or data.get("raw_answer") or ""
+            contact_field = data.get("contact")
+
+            print(f"Bot: {answer}")
+            print(f"Contact field present? {bool(contact_field)} "
+                  f"(expected: {row['expect_contact_field']})")
+
+if __name__ == "__main__":
+    main()
+
+
+This doesn’t assert yet, it just prints mismatches so you can see:
+
+Where contact shows up when it shouldn’t
+
+Where contact injection is missing when it should exist
+
+You can later turn those prints into assert calls if you want a proper test run.
+
+3️⃣ Deeper: unit-ish tests for the classifier / injection logic
+
+If you’re serious:
+
+Pull your intent classification and contact injection into small pure functions (no FastAPI, no DB).
+
+Write pytest tests that call them directly with strings and your fake state dict, and assert:
+
+what business_count becomes,
+
+what mode becomes (contact / done),
+
+whether injection happens or not.
+
+Example pattern:
+
+def test_greeting_does_not_increment_business():
+    state = {}
+    intent = "greeting"
+    new_state = apply_business_intent_state(state, intent)
+    assert new_state.get("business_count", 0) == 0
+
+def test_service_increments_business():
+    state = {}
+    intent = "service"
+    new_state = apply_business_intent_state(state, intent)
+    assert new_state["business_count"] == 1
+
+
+But that requires you to have that logic factored out. Right now it’s buried inside summarize. If you want, we can refactor that next.
+
+Pragmatic answer
+
+Given where you are:
+
+Do this now:
+
+Make the CSV (or sheet).
+
+Use the small Python script to drive your API and log behaviour.
+
+Once it stabilises and you’re not fighting basic bugs, then we can refactor out the intent/injection logic and slap proper unit tests on it.
+
+If you want, I can:
+
+Generate a bigger test_cases.csv for you pre-filled with all the service/contact/blog/career/casestudy examples we discussed.
+
+Or turn this into a Streamlit test harness where you click “Run all tests” and see pass/fail.
