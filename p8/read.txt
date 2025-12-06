@@ -217,3 +217,91 @@ async def llm_intent(query: str):
     # I am omitting the prompt text to save space, but paste your original function here.
     # It was logically fine, just needs to return the string.
     pass
+async def async_search_local_pgvector(
+    client_conn, 
+    query_vector: List[float], 
+    top_k: int = 10, 
+    source_type: Optional[str] = None, 
+    collection_name: Optional[str] = None,
+    use_reranking: bool = True
+) -> List[Dict[str, Any]]:
+    
+    if not collection_name:
+        logger.error("No collection name provided for search")
+        return []
+
+    # 1. Define the Search Logic (Reusable)
+    def build_query(target_source: Optional[str]):
+        where_clause = ""
+        params = [np.array(query_vector), top_k]
+        
+        # Use simple WHERE for filtering
+        if target_source:
+            where_clause = "WHERE source_type = %s"
+            params.insert(1, target_source)
+            
+        # REVERT TO COSINE DISTANCE (<=>)
+        # It is robust, works with standard indexes, and avoids negative math confusion.
+        sql = f"""
+            SELECT url, page_title, chunk_index, text, source_type,
+                   (vector <=> %s::vector) as distance
+            FROM {collection_name}
+            {where_clause}
+            ORDER BY vector <=> %s::vector ASC
+            LIMIT %s;
+        """
+        # Params: [source (opt), vector, vector, top_k]
+        sql_params = []
+        if target_source:
+            sql_params.append(target_source)
+        sql_params.append(np.array(query_vector)) # For SELECT
+        sql_params.append(np.array(query_vector)) # For ORDER BY
+        sql_params.append(top_k)
+        
+        return sql, tuple(sql_params)
+
+    try:
+        results = []
+        
+        # 2. ATTEMPT 1: Strict Filter (If intent is provided)
+        if source_type and source_type != "page": # Don't filter if intent is just 'page'
+            sql, params = build_query(source_type)
+            with client_conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+            
+            if rows:
+                logger.info(f"🎯 Strict Search ({source_type}) found {len(rows)} results.")
+                # Process rows...
+                results = [
+                    {
+                        "url": r[0], "page_title": r[1], "chunk_index": r[2], 
+                        "text": r[3], "source_type": r[4], 
+                        # Convert Distance (0..2) to Similarity (1..0) for Reranker
+                        "score": 1 - float(r[5]) 
+                    } for r in rows
+                ]
+                return results
+            else:
+                logger.warning(f"⚠️ Strict Search ({source_type}) found NOTHING. Falling back to broad search.")
+
+        # 3. ATTEMPT 2: Broad Search (Fallback)
+        # If strict search failed, or no source_type was given, search EVERYTHING.
+        sql, params = build_query(None)
+        with client_conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+
+        results = [
+            {
+                "url": r[0], "page_title": r[1], "chunk_index": r[2], 
+                "text": r[3], "source_type": r[4], 
+                "score": 1 - float(r[5]) 
+            } for r in rows
+        ]
+        
+        return results
+
+    except Exception as e:
+        logger.error(f"Search failed: {e}")
+        return []
