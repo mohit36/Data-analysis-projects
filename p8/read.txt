@@ -1,125 +1,70 @@
-class SearchAgent:
-    def __init__(self, collection_name=None):
-        self.collection_name = collection_name
-        self.client_conn = get_pgvector_client()
-        register_vector(self.client_conn)
+async def search_internal_answers_async(
+    client_conn,
+    query_text: str,
+    query_vector: list[float],
+    top_k: int = 10,
+    use_reranking: bool = False,
+):
+    loop = asyncio.get_running_loop()
+    cursor = client_conn.cursor(cursor_factory=DictCursor)
 
-    async def classify_query_type(self, query: str) -> str:
-        try:
-            return await llm_intent(query)
-        except Exception as e:
-            logger.exception(f"Intent classification failed: {e}")
-            return "page"  # safe default
+    collection_name = "cached_question_answer"
 
-    async def agent_search_async(
-        self,
-        query: str,
-        top_k: int = 10,
-        request_url: str | None = None,
-        country_code: str | None = None,
-    ) -> list[dict]:
-        # 1. Intent → source types
-        intent = await self.classify_query_type(query)
-        logger.info(f"🧠 Query intent: {intent}")
+    base_sql = f"""
+        SELECT 
+            id,
+            question,
+            answer_text,
+            frequency,
+            1 - (vector <=> %s::vector) AS score
+        FROM {collection_name}
+        ORDER BY vector <=> %s::vector
+        LIMIT %s;
+    """
+    params = (query_vector, query_vector, top_k)
 
-        primary_source_types = INTENT_TO_SOURCE_TYPES.get(intent, ["page", "blog", "case"])
+    rows = await loop.run_in_executor(
+        None,
+        lambda: (cursor.execute(base_sql, params), cursor.fetchall())[1],
+    )
 
-        # 2. Resolve region-specific table
-        final_table = get_collection_by_url(
-            request_url=request_url,
-            country_code=country_code,
-            default_collection=self.collection_name,
-        )
-        if not final_table:
-            logger.error("❌ No collection table resolved, aborting search")
-            return []
+    results = []
+    for row in rows:
+        results.append({
+            # core fields your pipeline expects
+            "id": row["id"],                     # internal DB id
+            "url": None,                         # no public URL
+            "page_title": row["question"],       # treat the question as title
+            "text": row["answer_text"],          # reranker uses this
+            "source_type": "internal",           # distinguish later
+            "chunk_index": 0,                    # single chunk
 
-        # 3. Embed query once
-        query_vector = model.encode(query).tolist()
+            # extra metadata (optional)
+            "score": float(row["score"]),
+            "frequency": row["frequency"],
+        })
 
-        # 4. Kick off parallel searches (typed + general + internal)
-        top_k_primary = max(top_k * 3, 30)   # oversample for rerank
-        top_k_general = max(top_k * 2, 20)
-        top_k_internal = top_k              # usually small
+    return results
+def _merge_and_dedup_candidates(self, *result_lists):
+    all_results = []
+    for lst in result_lists:
+        if lst:
+            all_results.extend(lst)
 
-        primary_task = async_search_local_pgvector(
-            client_conn=self.client_conn,
-            query_vector=query_vector,
-            top_k=top_k_primary,
-            source_type=primary_source_types,
-            collection_name=final_table,
-            query_text=query,
-            use_reranking=False,   # retrieval only
-        )
+    dedup = {}
 
-        general_task = async_search_local_pgvector(
-            client_conn=self.client_conn,
-            query_vector=query_vector,
-            top_k=top_k_general,
-            source_type=None,      # no filter
-            collection_name=final_table,
-            query_text=query,
-            use_reranking=False,
-        )
+    for r in all_results:
+        # Website chunks have URL; internal answers don't
+        if r.get("url"):
+            key = r["url"]
+        else:
+            # internal answers – use DB id or fallback to question
+            internal_id = r.get("id") or r.get("page_title")
+            key = f"internal://{internal_id}"
 
-        internal_task = search_internal_answers_async(
-            query_text=query,
-            query_vector=query_vector,
-            top_k=top_k_internal,
-        )
+        score = float(r.get("score", 0.0))
 
-        primary_results, general_results, internal_results = await asyncio.gather(
-            primary_task,
-            general_task,
-            internal_task,
-        )
+        if key not in dedup or score > dedup[key]["score"]:
+            dedup[key] = r
 
-        logger.info(
-            f"🔎 Retrieved: primary={len(primary_results)}, "
-            f"general={len(general_results)}, internal={len(internal_results)}"
-        )
-
-        # 5. Merge + dedup candidates
-        candidates = self._merge_and_dedup_candidates(
-            primary_results,
-            general_results,
-            internal_results,
-        )
-
-        if not candidates:
-            logger.warning("⚠️ No candidates from any source")
-            return []
-
-        # 6. Single global rerank
-        final_results, quality = await rerank_results_with_cross_encoder(
-            query=query,
-            results=candidates,
-            top_k=top_k,
-        )
-
-        logger.info(f"🏁 Final rerank quality: {quality}, returned={len(final_results)}")
-        return final_results
-
-    def _merge_and_dedup_candidates(
-        self,
-        primary_results: list[dict],
-        general_results: list[dict],
-        internal_results: list[dict],
-    ) -> list[dict]:
-        """Merge all candidates and deduplicate by URL or synthetic key."""
-
-        all_results = []
-        all_results.extend(primary_results or [])
-        all_results.extend(general_results or [])
-        all_results.extend(internal_results or [])
-
-        url_to_best: dict[str, dict] = {}
-        for r in all_results:
-            url = r.get("url") or f"internal://{id(r)}"
-            score = float(r.get("score", 0.0))
-            if url not in url_to_best or score > url_to_best[url]["score"]:
-                url_to_best[url] = r
-
-        # sort by vector score first; cross-encoder will do final sort
-        deduped = sorted(url_to_best.values(), key=lambda x: x.get("score", 0.0), reverse=True)
-        return deduped
+    return sorted(dedup.values(), key=lambda x: x.get("score", 0.0), reverse=True)
