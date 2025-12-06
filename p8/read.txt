@@ -1,70 +1,316 @@
-async def search_internal_answers_async(
-    client_conn,
-    query_text: str,
-    query_vector: list[float],
-    top_k: int = 10,
-    use_reranking: bool = False,
-):
-    loop = asyncio.get_running_loop()
-    cursor = client_conn.cursor(cursor_factory=DictCursor)
+Nice, respect for actually wiring it the way we discussed 🙌
+Since search_internal_answers_async is now in the right shape, next step is:
 
-    collection_name = "cached_question_answer"
+Plug it into agent_search_async and add a clean merge + single rerank.
 
-    base_sql = f"""
-        SELECT 
-            id,
-            question,
-            answer_text,
-            frequency,
-            1 - (vector <=> %s::vector) AS score
-        FROM {collection_name}
-        ORDER BY vector <=> %s::vector
-        LIMIT %s;
+Let’s do that in 2 small, focused moves.
+
+1️⃣ Add a helper to merge + dedup candidates
+
+Put this somewhere below SearchAgent in chatbot_search_new.py (or as a @staticmethod inside the class if you prefer).
+
+from typing import Any, Dict, List
+
+def merge_and_dedup_candidates(*result_lists: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    params = (query_vector, query_vector, top_k)
+    Merge candidates from multiple sources and deduplicate by URL or internal id.
 
-    rows = await loop.run_in_executor(
-        None,
-        lambda: (cursor.execute(base_sql, params), cursor.fetchall())[1],
-    )
+    Expected fields:
+      - url (for website chunks) OR
+      - id + source_type == "internal" (for internal answers)
+    """
 
-    results = []
-    for row in rows:
-        results.append({
-            # core fields your pipeline expects
-            "id": row["id"],                     # internal DB id
-            "url": None,                         # no public URL
-            "page_title": row["question"],       # treat the question as title
-            "text": row["answer_text"],          # reranker uses this
-            "source_type": "internal",           # distinguish later
-            "chunk_index": 0,                    # single chunk
-
-            # extra metadata (optional)
-            "score": float(row["score"]),
-            "frequency": row["frequency"],
-        })
-
-    return results
-def _merge_and_dedup_candidates(self, *result_lists):
-    all_results = []
+    all_results: List[Dict[str, Any]] = []
     for lst in result_lists:
         if lst:
             all_results.extend(lst)
 
-    dedup = {}
+    if not all_results:
+        return []
+
+    dedup: Dict[str, Dict[str, Any]] = {}
 
     for r in all_results:
-        # Website chunks have URL; internal answers don't
+        # Website chunks have a real URL
         if r.get("url"):
             key = r["url"]
         else:
-            # internal answers – use DB id or fallback to question
-            internal_id = r.get("id") or r.get("page_title")
+            # Internal answers: use DB id or question as stable key
+            internal_id = r.get("id") or r.get("page_title") or r.get("question")
             key = f"internal://{internal_id}"
 
         score = float(r.get("score", 0.0))
 
-        if key not in dedup or score > dedup[key]["score"]:
+        # Keep the highest-scoring candidate per key
+        if key not in dedup or score > dedup[key].get("score", 0.0):
             dedup[key] = r
 
+    # Sort by vector score before cross-encoder rerank (optional but nice)
     return sorted(dedup.values(), key=lambda x: x.get("score", 0.0), reverse=True)
+
+
+This assumes exactly what you now return from:
+
+async_search_local_pgvector (website)
+
+search_internal_answers_async (internal)
+
+2️⃣ Update agent_search_async to use website + internal + rerank
+
+Now replace the body of SearchAgent.agent_search_async with this version.
+
+Don’t touch the signature; just replace inside the function.
+
+class SearchAgent:
+    def __init__(self, collection_name=None, intent=None):
+        # Initialize the agent with a default collection name and other configurations
+        self.collection_name = collection_name or PGTABLE_BASE
+        self.intent = intent
+        self.client_conn = get_pgvector_client()  # Assuming this connects to a database or vector store
+        register_vector(self.client_conn)         # Assuming this registers the vector-based client
+
+    async def classify_query_type(self, query):
+        try:
+            llm_result = await llm_intent(query)
+            self.intent = llm_result
+            return llm_result
+        except Exception as e:
+            logger.error(f"Intent classification failed: {e}")
+            return "page"  # Default fallback
+
+    async def agent_search_async(self, query, top_k=10, request_url=None, country_code=None):
+        """
+        Search with intent classification, website search, internal answers search,
+        and a single global rerank.
+        """
+
+        # 1. Get intent and map to primary source types
+        intent = await self.classify_query_type(query)
+        logger.info(f"🧠 Query intent: {intent}")
+
+        intent_to_source_type = {
+            "case": "case",
+            "greeting": None,
+            "conclusion": None,
+            "contact": "contact",
+            "about": "about",
+            "career": "career",
+            "page": "page",
+        }
+        primary_source_type = intent_to_source_type.get(intent, "page")
+
+        # 2. Resolve table by URL/country (SG/PH vs AU etc.)
+        final_table = get_collection_by_url(
+            request_url=request_url,
+            base_collection=self.collection_name,
+            country_code=country_code,
+        )
+
+        if not final_table:
+            logger.error(f"❌ No matching collection (url={request_url}, cc={country_code})")
+            raise RuntimeError("No matching regional collection available")
+
+        # 3. Embed query once
+        query_vector = model.encode([query])[0].tolist()
+
+        # Oversample for reranking
+        top_k_primary = max(top_k * 3, 30)
+        top_k_internal = max(top_k, 10)
+
+        # 4. Kick off website + internal search in parallel
+        primary_task = async_search_local_pgvector(
+            self.client_conn,
+            query_vector=query_vector,
+            top_k=top_k_primary,
+            source_type=primary_source_type,
+            collection_name=final_table,
+            query_text=query,
+            use_reranking=False,  # retrieval only; rerank later
+        )
+
+        internal_task = search_internal_answers_async(
+            self.client_conn,
+            query_text=query,
+            query_vector=query_vector,
+            top_k=top_k_internal,
+            use_reranking=False,  # same idea: retrieval only
+        )
+
+        primary_results, internal_results = await asyncio.gather(
+            primary_task,
+            internal_task,
+        )
+
+        logger.info(
+            f"🔎 Retrieved candidates: website={len(primary_results)}, "
+            f"internal={len(internal_results)}"
+        )
+
+        # 5. Merge + dedup candidates
+        candidates = merge_and_dedup_candidates(primary_results, internal_results)
+
+        if not candidates:
+            logger.warning("⚠️ No candidates from website or internal answers")
+            return []
+
+        # 6. Single global rerank with cross-encoder
+        reranked_results, quality = await rerank_results_with_cross_encoder(
+            query=query,
+            results=candidates,
+            top_k=top_k,
+        )
+
+        logger.info(f"🏁 Final rerank quality: {quality}, returned={len(reranked_results)}")
+
+        return reranked_results
+
+What this gives you right now
+
+✅ Website search (filtered by source_type from intent)
+
+✅ Internal answers search (your cached Q/A DB)
+
+✅ Both run in parallel using asyncio.gather
+
+✅ Results are merged + deduped
+
+✅ One global rerank for all candidates
+
+No general (no-source_type) search yet — we can add that in the next step once this is working and tested.
+
+3️⃣ What to do after this compiles
+
+Run a few manual tests in your API:
+
+Normal website-only query (e.g. “cloud security services”).
+
+Pure internal answer query (something you put in cached_question_answer).
+
+A query that could match both.
+
+Check logs for:
+
+Retrieved candidates: website=X, internal=Y
+
+Final rerank quality: ...
+
+If that all looks sane and you’re not hitting any key errors, we’re ready for the next enhancement:
+
+Add general (no-source_type) website search as a third parallel task
+and include it in merge_and_dedup_candidates → reranker.
+
+When you’re done implementing this step, tell me:
+
+“Done, add general search now”
+
+and I’ll show you the minimal changes (one more task + one more argument into merge_and_dedup_candidates).
+
+
+
+
+Nice, this is a clean piece to add.
+Let’s set up your internal cached Q/A table in Postgres with pgvector + HNSW using cosine distance (matching your query).
+
+I’ll give you:
+
+CREATE EXTENSION (pgvector)
+
+CREATE TABLE cached_question_answer
+
+HNSW index for cosine distance
+
+Optional tuning tips
+
+The HNSW syntax is straight from the official pgvector docs. 
+GitHub
++1
+
+1️⃣ Enable pgvector (once per database)
+
+Run this in your DB (as superuser / migration):
+
+CREATE EXTENSION IF NOT EXISTS vector;
+
+2️⃣ Create the internal answers table
+
+You’re using thenlper/gte-large as the embedding model, which is 1024-dimensional.
+If you ever switch models, adjust the 1024 accordingly.
+
+CREATE TABLE cached_question_answer (
+    id           bigserial PRIMARY KEY,
+    question     text        NOT NULL,
+    answer_text  text        NOT NULL,
+    frequency    integer     NOT NULL DEFAULT 0,
+    embedding    vector(1024) NOT NULL  -- adjust dim if your model is different
+);
+
+
+frequency → how often this Q/A is used (for analytics / ordering)
+
+embedding → the vector for question (or question+context)
+
+This matches how pgvector expects the vector type to be created. 
+GitHub
+
+3️⃣ Create HNSW index for cosine distance
+
+You’re already querying with:
+
+ORDER BY embedding <=> %s::vector
+
+
+and comments say “cosine distance”, so we use vector_cosine_ops in the index. 
+GitHub
++1
+
+CREATE INDEX cached_question_answer_embedding_hnsw_idx
+ON cached_question_answer
+USING hnsw (embedding vector_cosine_ops);
+
+
+If you want explicit params (optional, defaults are usually fine):
+
+CREATE INDEX cached_question_answer_embedding_hnsw_idx
+ON cached_question_answer
+USING hnsw (embedding vector_cosine_ops)
+WITH (m = 16, ef_construction = 64);
+
+4️⃣ Basic query pattern (what your Python is doing)
+
+This is basically what your function runs:
+
+SELECT
+    id,
+    question,
+    answer_text,
+    frequency,
+    1 - (embedding <=> $1::vector) AS score
+FROM cached_question_answer
+ORDER BY embedding <=> $1::vector
+LIMIT $2;
+
+
+embedding <=> $1 is the cosine distance
+
+1 - distance → similarity score in [0,1] for your Python dicts
+
+This pattern is exactly how pgvector docs show using HNSW with cosine distance. 
+GitHub
++1
+
+5️⃣ Optional: ANALYZE + runtime tuning
+
+After you bulk insert your top 100 Q/As:
+
+ANALYZE cached_question_answer;
+
+
+If you ever want better recall at the cost of speed, at session level:
+
+SET hnsw.ef_search = 100;  -- default 40, higher = better recall, slower
+
+
+(You can also SET LOCAL hnsw.ef_search = 100 inside a transaction for one query.) 
+GitHub
+
+If you paste your current Python base_sql for search_internal_answers_async I can double-check that the column name (embedding) and dimension (vector(1024)) line up perfectly with this DDL so you don’t hit any “column does not have dimensions” or type mismatch errors.
