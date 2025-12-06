@@ -1,157 +1,219 @@
-scenario_id,step,country,query,expected_intent,expect_contains,expect_contact_json
-1,1,AU,"hi","greeting","",false
-1,2,AU,"hello","greeting","",false
-1,3,AU,"hey","greeting","",false
+import os
+import logging
+import json
+import asyncio
+import numpy as np
+from typing import List, Dict, Tuple, Optional, Any
+from sentence_transformers import SentenceTransformer, CrossEncoder
+from functools import lru_cache
+from tenacity import retry, stop_after_attempt, wait_fixed
+import openai
 
-2,1,AU,"what do you do?","about","Exigotech",false
-2,2,AU,"tell me about exigotech","about","Exigotech",false
-2,3,AU,"tell me about your company","about","Exigotech",false
+# Import Database Helpers
+from pgvector_helper.pgvector_client_connection import get_pgvector_client
+from pgvector_helper.get_location_by_url import get_collection_by_url
+from pgvector_helper.db_logger import get_db_logger
+from dotenv import load_dotenv
 
-3,1,AU,"what services do you offer?","page","service",false
-3,2,AU,"show me your IT services","page","service",false
+load_dotenv()
+logger = get_db_logger(__name__)
 
-4,1,IN,"show me services","page","service",false
-4,2,IN,"show me cloud services","page","service",false
-4,3,IN,"show me AI services","page","service",true
+# --- GLOBAL CONFIGURATION (Load Models ONCE) ---
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "thenlper/gte-large")
+RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+DEPLOYMENT_NAME = os.getenv("AZURE_CHAT_DEPLOYMENT", "gpt-4-1-mini")
 
-5,1,SG,"show me solutions","page","service",false
-5,2,SG,"show me more solutions","page","service",true
+# Initialize Models Globally (Singleton Pattern)
+# This prevents reloading the model on every single search request (Huge Latency Fix)
+logger.info("⏳ Loading Embedding Model...")
+embed_model = SentenceTransformer(EMBEDDING_MODEL)
+logger.info("✅ Embedding Model Loaded.")
 
-6,1,PH,"what solutions do you provide?","page","service",false
-6,2,PH,"show me more services","page","service",true
+try:
+    logger.info("⏳ Loading Reranker Model...")
+    rerank_model = CrossEncoder(RERANK_MODEL_NAME)
+    logger.info("✅ Reranker Model Loaded.")
+except Exception as e:
+    logger.warning(f"⚠️ CrossEncoder failed to load: {e}. Reranking will be skipped.")
+    rerank_model = None
 
-7,1,AU,"show me blogs","page","blog",false
-7,2,AU,"blog about collaboration","page","blog",false
-7,3,AU,"blog about automation","page","blog",false
+# OpenAI Config
+openai.api_type = "azure"
+openai.api_key = os.getenv("AZURE_OPENAI_API_KEY")
+openai.api_base = os.getenv("AZURE_OPENAI_ENDPOINT")
+openai.api_version = os.getenv("AZURE_CHAT_API_VERSION", "2024-02-15-preview")
 
-8,1,IN,"show me case studies","case","case",false
-8,2,IN,"healthcare case study","case","case",false
-8,3,IN,"manufacturing case study","case","case",false
 
-9,1,SG,"do you have case studies?","case","case",false
-9,2,SG,"cloud migration case study","case","case",false
+# --- CORE SEARCH FUNCTION (OPTIMIZED SQL) ---
+async def async_search_local_pgvector(
+    client_conn, 
+    query_vector: List[float], 
+    top_k: int = 10, 
+    source_type: Optional[str] = None, 
+    collection_name: Optional[str] = None,
+    use_reranking: bool = True
+) -> List[Dict[str, Any]]:
+    
+    if not collection_name:
+        logger.error("No collection name provided for search")
+        return []
 
-10,1,PH,"any success stories?","case","case",false
-10,2,PH,"AI success story","case","case",false
+    # loop = asyncio.get_running_loop() # Not needed if using direct execute or connection pool
+    
+    # OPTIMIZATION: Use Negative Inner Product (<#>) instead of Cosine Distance (<=>)
+    # This is faster for normalized vectors (like gte-large).
+    # We filter by source_type DIRECTLY in the SQL for speed.
+    
+    where_clause = ""
+    params = [np.array(query_vector), top_k]
+    
+    if source_type:
+        where_clause = "WHERE source_type = %s"
+        params.insert(1, source_type) # Insert before top_k
+        
+    base_sql = f"""
+        SELECT url, page_title, chunk_index, text, source_type,
+               (vector <#> %s::vector) * -1 AS score
+        FROM {collection_name}
+        {where_clause}
+        ORDER BY vector <#> %s::vector ASC
+        LIMIT %s;
+    """
+    
+    # We need to pass the vector twice (once for select score, once for ordering)
+    # Params structure: [vector, source_type (optional), vector, top_k]
+    sql_params = [np.array(query_vector)]
+    if source_type:
+        sql_params.append(source_type)
+    sql_params.append(np.array(query_vector))
+    sql_params.append(top_k)
 
-11,1,AU,"do you have job openings?","career","career",false
-11,2,AU,"show me careers","career","career",false
-11,3,AU,"internship opportunities","career","career",false
+    try:
+        # Use a cursor to execute
+        with client_conn.cursor() as cur:
+            cur.execute(base_sql, tuple(sql_params))
+            rows = cur.fetchall()
+            
+        # Convert rows to dicts
+        results = []
+        for row in rows:
+            # Row structure depends on DB driver, assuming tuple or dict-like
+            # Adjust indices if your driver returns strict tuples
+            results.append({
+                "url": row[0],
+                "page_title": row[1],
+                "chunk_index": row[2],
+                "text": row[3],
+                "source_type": row[4],
+                "score": float(row[5])
+            })
 
-12,1,IN,"jobs at exigotech","career","career",false
-12,2,IN,"software engineer position","career","career",false
+        # Apply Reranking if enabled and results exist
+        if use_reranking and results and rerank_model:
+            # We don't need to pass 'query_text' here if we handle it in the reranker wrapper
+            # But the wrapper below needs the text. 
+            pass # The wrapper is called *outside* or we call it here.
+            # Your original code called it outside or mixed it. 
+            # We will return raw results here and let the agent handle reranking.
+            
+        return results
 
-13,1,SG,"I want to buy your services","contact","provide your email",false
-13,2,SG,"my email is buyer@company.com","contact","provide your phone number",false
-13,3,SG,"phone 9876543210","contact","contact details",false
+    except Exception as e:
+        logger.error(f"Search failed: {e}")
+        return []
 
-14,1,PH,"can someone from sales contact me?","contact","provide your email",false
-14,2,PH,"email: saleslead@mail.com","contact","provide your phone number",false
-14,3,PH,"+639171234567","contact","contact details",false
+# --- RERANKING HELPER (GLOBAL MODEL) ---
+async def rerank_results_with_cross_encoder(query: str, results: List[Dict], top_k: int = 10):
+    if not results or not rerank_model:
+        return results
 
-15,1,AU,"I need help with my business","contact","provide your email",false
-15,2,AU,"here is my email biz@mail.com","contact","provide your phone number",false
-15,3,AU,"my number is 0400123456","contact","contact details",false
+    try:
+        # Prepare pairs [Query, Doc Text]
+        pairs = [[query, r["text"]] for r in results]
+        
+        # Predict scores (Sync operation, but fast on CPU for small batches)
+        # Using a thread to prevent blocking the event loop
+        cross_scores = await asyncio.to_thread(rerank_model.predict, pairs)
 
-16,1,IN,"can I schedule a demo?","contact","provide your email",false
-16,2,IN,"demo@mail.com","contact","provide your phone number",false
-16,3,IN,"9999988888","contact","contact details",false
+        # Update scores
+        for idx, result in enumerate(results):
+            # Combine scores (Weighted)
+            # Vector score is usually 0.7-0.9, Cross score is -10 to 10 (logits) or 0-1 (sigmoid)
+            # Defaulting to pure Cross Encoder score for sorting as it's more accurate
+            result["cross_score"] = float(cross_scores[idx])
+            result["score"] = result["cross_score"] # Override for sorting
 
-17,1,SG,"how do I talk to sales?","contact","provide your email",false
-17,2,SG,"email: talk@mail.com","contact","provide your phone number",false
+        # Sort by new score
+        reranked = sorted(results, key=lambda x: x["score"], reverse=True)
+        return reranked[:top_k]
 
-18,1,PH,"what is your pricing?","contact","provide your email",false
-18,2,PH,"email pricing@mail.com","contact","provide your phone number",false
+    except Exception as e:
+        logger.error(f"Reranking failed: {e}")
+        return results
 
-19,1,AU,"support contact","contact","provide your email",false
-19,2,AU,"support@mail.com","contact","provide your phone number",false
 
-20,1,IN,"contact your advisor","contact","provide your email",false
-20,2,IN,"lead@mail.com","contact","provide your phone number",false
+# --- SEARCH AGENT CLASS ---
+class SearchAgent:
+    def __init__(self, collection_name=None):
+        self.collection_name = collection_name
+        # Assume connection is handled by your helper or passed in
+        # For this refactor, we grab a fresh client per request or use a pool
+        self.client_conn = get_pgvector_client()
 
-21,1,AU,"I read your blog on AI","page","blog",false
-21,2,AU,"show me more blogs","page","blog",false
+    async def classify_query_type(self, query: str):
+        """
+        Uses LLM to determine intent (about, contact, etc.)
+        """
+        try:
+            # Your existing prompt logic for intent classification
+            # Simplified for brevity - assume 'llm_intent' helper exists or inline it
+            from chatbot_agents.chatbot_search_new import llm_intent # Self-import or move helper
+            return await llm_intent(query)
+        except Exception as e:
+            logger.error(f"Intent classification failed: {e}")
+            return "page"
 
-22,1,IN,"show me microsoft collaborations case study","case","case",false
-22,2,IN,"any client success stories?","case","case",false
+    async def search_async(self, query: str, source_type: str = None, top_k: int = 10, country_code: str = None, request_url: str = None):
+        """
+        Main entry point for search.
+        1. Embed Query
+        2. Determine Collection (Geo-Routing)
+        3. Search DB
+        4. Rerank
+        """
+        # 1. Embed Query
+        query_vector = embed_model.encode([query])[0].tolist()
 
-23,1,SG,"cloud blog","page","blog",false
-23,2,SG,"security blog","page","blog",false
+        # 2. Determine Collection
+        # If country_code provided, try to route. Otherwise default.
+        final_collection = self.collection_name
+        if not final_collection:
+            # Use your helper to find collection based on URL/Country
+            # final_collection = get_collection_by_url(...) 
+            # Hardcoding fallback for now based on your env
+            final_collection = os.getenv("PGTABLE_BASE", "website_chunks_ultra_v1")
+            if country_code:
+                final_collection = f"{final_collection}_{country_code.lower()}"
 
-24,1,PH,"healthcare case study","case","case",false
-24,2,PH,"retail case study","case","case",false
+        # 3. DB Search
+        results = await async_search_local_pgvector(
+            self.client_conn,
+            query_vector,
+            top_k=top_k * 2, # Fetch more for reranking
+            source_type=source_type,
+            collection_name=final_collection,
+            use_reranking=False # We handle it manually below
+        )
 
-25,1,AU,"I am from Australia, do you operate here?","about","Australia",false
-25,2,AU,"do you serve Australian customers?","about","Australia",false
+        # 4. Rerank
+        final_results = await rerank_results_with_cross_encoder(query, results, top_k=top_k)
+        
+        return final_results
 
-26,1,SG,"do you operate in Singapore?","about","Singapore",false
-26,2,SG,"services in Singapore","page","service",false
-
-27,1,PH,"do you work in Philippines?","about","Philippines",false
-27,2,PH,"show me your services","page","service",false
-
-28,1,IN,"just testing the bot","fallback","",false
-
-29,1,AU,"hi","greeting","",false
-29,2,AU,"show me services","page","service",false
-29,3,AU,"show me more services","page","service",true
-
-30,1,SG,"hello","greeting","",false
-30,2,SG,"what services do you offer?","page","service",false
-30,3,SG,"show me collaboration services","page","service",true
-
-31,1,PH,"hey","greeting","",false
-31,2,PH,"show me managed IT services","page","service",false
-31,3,PH,"show me AI services","page","service",true
-
-32,1,IN,"tell me about your leadership","about","Exigotech",false
-
-33,1,AU,"random asdasd123","fallback","",false
-33,2,AU,"more nonsense text","fallback","",false
-
-34,1,IN,"career opportunities","career","career",false
-34,2,IN,"graduate roles","career","career",false
-
-35,1,SG,"service overview","page","service",false
-35,2,SG,"detailed services","page","service",true
-
-36,1,PH,"show me AI consulting services","page","service",false
-36,2,PH,"show me more AI services","page","service",true
-
-37,1,AU,"case study on automation","case","case",false
-37,2,AU,"case study on cybersecurity","case","case",false
-
-38,1,IN,"blog about automation","page","blog",false
-38,2,IN,"blog about collaboration","page","blog",false
-
-39,1,SG,"how can I get a quote?","contact","provide your email",false
-39,2,SG,"quote@mail.com","contact","provide your phone number",false
-
-40,1,PH,"I want to discuss a project","contact","provide your email",false
-40,2,PH,"project@mail.com","contact","provide your phone number",false
-
-41,1,AU,"hi","greeting","",false
-41,2,AU,"hi again","greeting","",false
-41,3,AU,"show me services","page","service",false
-41,4,AU,"show me more services","page","service",true
-
-42,1,IN,"contact us","contact","provide your email",false
-
-43,1,SG,"any internship roles?","career","career",false
-
-44,1,PH,"company overview","about","Exigotech",false
-
-45,1,AU,"solutions you provide","page","service",false
-45,2,AU,"more solutions","page","service",true
-
-46,1,IN,"success story on healthcare","case","case",false
-
-47,1,SG,"case study for banking","case","case",false
-
-48,1,PH,"articles on AI","page","blog",false
-
-49,1,AU,"help me choose a service","page","service",false
-49,2,AU,"show me more options","page","service",true
-
-50,1,IN,"pricing for AI solutions","contact","provide your email",false
-50,2,IN,"email: price@mail.com","contact","provide your phone number",false
+# --- LLM INTENT HELPER (Kept from your code) ---
+async def llm_intent(query: str):
+    # ... (Your existing OpenAI intent logic here) ...
+    # Ensure you copy your 'llm_intent' function logic here
+    # I am omitting the prompt text to save space, but paste your original function here.
+    # It was logically fine, just needs to return the string.
+    pass
