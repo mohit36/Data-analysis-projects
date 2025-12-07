@@ -1,44 +1,335 @@
-about_person_intent_prompt = """
-You generate concise, factual information about a PERSON, TEAM MEMBER, or DEPARTMENT using ONLY the provided search results.
+Good, this is the right moment to wire all the new prompts into the actual flow.
 
-### RULES
-- Use ONLY the chunk text and metadata from the top 5 search results.
-- Never add information not present in context.
-- Never guess names, roles, experience, certifications, or contact details.
-- If the query is about a person or role and context contains matching info, summarize it.
-- If no matching person appears in context, return a clean fallback indicating no information available.
-- Keep tone professional, concise, neutral.
-- No marketing fluff. No external knowledge. No hallucination.
+I’ll map **exactly which prompt is used where**, and show the key code blocks you need to adjust. I’ll keep it patch-style so you can drop it into the existing files.
 
-### OUTPUT FORMAT (JSON)
-{
-  "answer": "10–50 word summary strictly from context, or fallback text.",
-  "key_points": ["Item Name: [inline link]", ...],   // only if found; no descriptions
-  "contact_suggestion": "Connect with {Person Name}?" OR "No contact info found.",
-  "related_services": ["service1", "service2"],      // optional; only if present in context
-  "fallback": "only if no relevant person/team info found"
-}
+---
 
-### LOGIC DETAILS
-1. ANSWER
-- Provide a factual 10–50 word summary about the person/team based ONLY on the given chunks.
-- If no such info exists, use:
-  "I don't have information on that person or role in the available context."
+## 1. Imports in `chatbot_search_new.py`
 
-2. KEY POINTS
-- If context includes structured points (features, accomplishments, expertise), list them.
-- Use ONLY:  "Item Name: [link]" format.
-- If none: return an empty list.
+At the top of **`code/chatbot_agents/chatbot_search_new.py`**, where you already import prompts, make sure you have **all** of these:
 
-3. CONTACT SUGGESTION
-- If any chunk contains a person name + contact or LinkedIn link → suggest connecting.
-- If not present → "No contact info found."
+```python
+from prompt_list import (
+    main_intent_classifier,              # intent classification (greeting/contact/about/…)
+    query_type_classification_prompt,    # standalone / follow_up / under_specified
+    query_decontextualization_prompt,    # uses HISTORY
+    query_rewrite_no_history_prompt,     # rewrite with NO history
+    clarification_underspecified_prompt, # “this is too vague” clarifier
+    clarification_followup_prompt,       # “you’re referring to earlier context” clarifier
+)
+```
 
-4. RELATED SERVICES
-- If context mentions services tied to this person/team (e.g., “Cloud”, “Security”), include 1–3 items.
-- MUST come from context only.
+Names need to match whatever you actually used in `prompt_list.py` – adjust if you named them slightly differently.
 
-### INPUT
-User query: {USER_QUERY}
-Top search results: {CHUNKS}
-"""
+---
+
+## 2. One small shared LLM helper (in `chatbot_search_new.py`)
+
+Somewhere near the top (after imports and env config), add this tiny helper if you don’t already have an equivalent:
+
+```python
+import openai
+import os
+
+AZURE_CHAT_DEPLOYMENT = os.getenv("AZURE_CHAT_DEPLOYMENT", "gpt-4.1-mini")
+
+
+async def _call_llm_zero_temp(prompt: str, max_tokens: int = 256) -> str:
+    """Single helper to call Azure Chat with a raw prompt, temp=0."""
+    resp = await openai.ChatCompletion.acreate(
+        engine=AZURE_CHAT_DEPLOYMENT,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+        max_tokens=max_tokens,
+    )
+    return resp["choices"][0]["message"]["content"].strip()
+```
+
+This is what all the new prompts will use.
+
+---
+
+## 3. History-aware query processing
+
+You already have the high-level controller (based on our architecture):
+
+* `process_query_with_context(query, history, relevance_threshold)`
+* `contextualize_query(query, history, relevance_threshold)` or similar
+
+We’re going to plug the prompts in there.
+
+### 3.1 Query-form classifier (standalone / follow_up / under_specified)
+
+Add this function in `chatbot_search_new.py`:
+
+```python
+async def classify_query_form(query: str) -> str:
+    """
+    Use query_type_classification_prompt to decide:
+    - 'standalone'
+    - 'follow_up'
+    - 'under_specified'
+    """
+    prompt = query_type_classification_prompt.replace("{query}", query)
+    raw = await _call_llm_zero_temp(prompt, max_tokens=8)
+    label = raw.strip().lower()
+    if "follow_up" in label:
+        return "follow_up"
+    if "under" in label:  # under_specified
+        return "under_specified"
+    return "standalone"
+```
+
+### 3.2 Decontextualize WITH history
+
+This is where history is actually used:
+
+```python
+def _history_to_text(history: list[dict]) -> str:
+    """Turn DB history rows into a compact text snippet for the prompt."""
+    lines = []
+    for msg in history[-6:]:  # last few exchanges only
+        role = msg.get("role") or msg.get("speaker") or "user"
+        content = msg.get("content") or msg.get("text") or ""
+        lines.append(f"{role.capitalize()}: {content}")
+    return "\n".join(lines)
+
+
+async def decontextualize_query_with_history(query: str, history: list[dict]) -> str:
+    """
+    Use query_decontextualization_prompt to rewrite the query into a
+    standalone version, using ONLY relevant history snippet.
+    """
+    history_text = _history_to_text(history)
+    prompt = (
+        query_decontextualization_prompt
+        .replace("{query}", query)
+        .replace("{history}", history_text)
+    )
+    rewritten = await _call_llm_zero_temp(prompt, max_tokens=128)
+    return rewritten.strip()
+```
+
+### 3.3 Rewrite WITHOUT history
+
+Used for “standalone but messy” queries (acronyms, partial phrases, etc.):
+
+```python
+async def rewrite_query_no_history(query: str) -> str:
+    """
+    Use query_rewrite_no_history_prompt to clean up a standalone query
+    (expand abbreviations, make it search-ready) WITHOUT adding history.
+    """
+    prompt = query_rewrite_no_history_prompt.replace("{query}", query)
+    rewritten = await _call_llm_zero_temp(prompt, max_tokens=128)
+    return rewritten.strip()
+```
+
+### 3.4 Clarification question generators
+
+We’ll use these when query is under-specified or refers to missing context:
+
+```python
+async def generate_underspecified_clarification(query: str) -> str:
+    prompt = clarification_underspecified_prompt.replace("{query}", query)
+    question = await _call_llm_zero_temp(prompt, max_tokens=64)
+    return question.strip()
+
+
+async def generate_followup_clarification(query: str) -> str:
+    prompt = clarification_followup_prompt.replace("{query}", query)
+    question = await _call_llm_zero_temp(prompt, max_tokens=64)
+    return question.strip()
+```
+
+---
+
+## 4. Wire everything into `process_query_with_context`
+
+Find your controller function (name might be exactly this, or very close).
+We want it to:
+
+1. Classify **form**: standalone / follow_up / under_specified
+2. Filter history by relevance
+3. Decide whether to:
+
+   * ask for clarification, OR
+   * rewrite with history, OR
+   * rewrite without history
+
+Here is a drop-in version you can adapt (keep the signature you already use):
+
+```python
+async def process_query_with_context(
+    query: str,
+    history: list[dict],
+    relevance_threshold: float = 0.55,
+) -> tuple[str, dict]:
+    """
+    Main controller for query → (possibly rewritten query, metadata).
+
+    Returns:
+      processed_query: str  (may be same as input)
+      meta: {
+        "needs_clarification": bool,
+        "clarification_question": Optional[str],
+        "query_form": "standalone|follow_up|under_specified",
+      }
+    """
+    meta: dict[str, any] = {
+        "needs_clarification": False,
+        "clarification_question": None,
+        "query_form": None,
+    }
+
+    # 1) Classify query form
+    query_form = await classify_query_form(query)
+    meta["query_form"] = query_form
+
+    # 2) Filter history by relevance (you already have this function)
+    filtered_history = filter_history_by_relevance(
+        history=history,
+        query=query,
+        threshold=relevance_threshold,
+    )
+
+    # 3) If underspecified → clarification only
+    if query_form == "under_specified":
+        clar_q = await generate_underspecified_clarification(query)
+        meta["needs_clarification"] = True
+        meta["clarification_question"] = clar_q
+        # We still return original query; caller will short-circuit.
+        return query, meta
+
+    # 4) Follow-up: needs history
+    if query_form == "follow_up":
+        if filtered_history:
+            rewritten = await decontextualize_query_with_history(query, filtered_history)
+            return rewritten, meta
+        else:
+            # Query refers to something, but we have no usable history
+            clar_q = await generate_followup_clarification(query)
+            meta["needs_clarification"] = True
+            meta["clarification_question"] = clar_q
+            return query, meta
+
+    # 5) Standalone: no history; just clean rewrite
+    rewritten = await rewrite_query_no_history(query)
+    return rewritten, meta
+```
+
+---
+
+## 5. Use `process_query_with_context` inside `hybrid_query_search`
+
+Now, inside your `hybrid_query_search` (or whatever you call the RAG entrypoint) you should already be doing something like:
+
+```python
+processed_query, results, search_metadata = await hybrid_query_search(
+    query=query,
+    history=session_history_snapshot,
+    ...
+)
+```
+
+Make sure the **first step** in that function is now:
+
+```python
+async def hybrid_query_search(...):
+    # 0) Contextualize query first (includes history + clarification logic)
+    processed_query, ctx_meta = await process_query_with_context(
+        query=query,
+        history=history,
+        relevance_threshold=0.55,
+    )
+
+    # If clarification needed → bubble this up immediately
+    if ctx_meta.get("needs_clarification"):
+        return processed_query, [], {
+            "needs_clarification": True,
+            "clarification_question": ctx_meta.get("clarification_question"),
+        }
+
+    # 1) Embed processed_query, run vector search, rerank, etc.
+    ...
+```
+
+You already have the “clarification” handling in `chatbot_api.py` (checking `search_metadata["needs_clarification"]`), so this fits directly.
+
+---
+
+## 6. Where the **about_person_intent_prompt** goes
+
+This is **not** in `chatbot_search_new.py` – it lives in your answer generator:
+
+`code/chatbot_agents/exigotech_chatbot.py`
+
+You already have logic like:
+
+```python
+from prompt_list import (
+    greeting_response_prompt,
+    conclusion_response_prompt,
+    contact_intent_prompt,
+    about_intent_prompt,         # old one
+    career_intent_prompt,
+    page_intent_prompt,
+    case_intent_prompt,
+    # ...
+)
+```
+
+Now:
+
+1. Replace the old `about_intent_prompt` import with your new `about_person_intent_prompt`.
+2. In `generate_exigotech_answer`, where you choose which prompt to use based on `intent`, make sure:
+
+```python
+elif intent == "about":
+    prompt = about_person_intent_prompt
+```
+
+That ensures:
+
+* For intent “about”, the LLM uses the **person/team** style prompt with:
+
+  * `answer`
+  * `key_points`
+  * `contact_suggestion`
+  * `related_services`
+  * `fallback`
+
+Later we can update `run_exigotech_prompt` to parse the JSON and feed it cleanly to UI / mapped buttons, but wiring the prompt first is step one.
+
+---
+
+## 7. Quick mental check: history use vs no-history use
+
+* **History used only here:**
+
+  * `decontextualize_query_with_history(...)` → called **only** when:
+
+    * classifier says `follow_up`, AND
+    * `filter_history_by_relevance` returns something above threshold
+
+* **No history:**
+
+  * `rewrite_query_no_history(...)` for standalone queries
+  * contact classification, intent classification, about intent, etc. stay context-free or RAG-only
+
+So your **“Yes” to contact** will **not** randomly trigger when the user is just saying “yes tell me more about that service” — because:
+
+1. Intent classifier sees it as `follow_up`,
+2. Contextualizer uses history and rewrites to a proper standalone question about that service,
+3. Only your **micro_llm** contact classifier decides if the last exchange really was a contact offer, and we already narrowed that logic.
+
+---
+
+If you paste these blocks into the right places and keep the function names consistent with what you already have, your new prompts are now fully “in the loop”:
+
+* History-aware decontextualization where it matters
+* Minimal rewrite for clean queries
+* Clarification instead of guessing
+* About-person answers that include key points + related services + contact hints
+
+If you hit any concrete error (NameError, import issue, etc.), paste the traceback or the relevant 20–30 lines and I’ll fix it surgically.
