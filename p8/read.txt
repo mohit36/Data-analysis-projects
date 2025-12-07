@@ -16,3 +16,299 @@ for item in results:
 
     if len(useful_links) >= 5:
         break
+
+
+
+
+Nice, let’s do this properly and still keep you in control.
+We’ll refactor `generate_exigotech_answer` in a way that:
+
+* Uses **only the top, reranked chunks** (fewer tokens).
+* Builds a **compact, clean context string**.
+* Keeps the **same signature** and still returns a `str`.
+* Still allows your prompts in `prompts.py` to be used later (we won’t break that).
+* Does **not** depend on any external internet stuff.
+
+Since I don’t see your current `exigotech_chatbot.py`, I’ll give you a **drop-in replacement for the function**, plus a tiny helper. You can adjust the LLM client part to match your existing setup (Azure/OpenAI/etc).
+
+---
+
+## 1️⃣ Patch: helper to build compact context
+
+**File:** `code/chatbot_agents/exigotech_chatbot.py`
+**Goal:** Add a helper to turn `results` into a trimmed context.
+
+🔍 **Find a good place near the top of the file**, after imports, and insert:
+
+```python
+from typing import Any, Dict, List, Optional
+
+
+def _build_context_from_chunks(
+    chunks: List[Dict[str, Any]],
+    max_chars: int = 6000,
+) -> str:
+    """
+    Build a compact context string from reranked chunks.
+
+    - Uses only the first N chunks (as passed in).
+    - Truncates total characters to max_chars.
+    - Includes title + URL + snippet for each source.
+    """
+    parts: List[str] = []
+    remaining = max_chars
+
+    for idx, ch in enumerate(chunks, start=1):
+        if not isinstance(ch, dict):
+            continue
+
+        title = ch.get("page_title") or ch.get("title") or "Untitled"
+        url = ch.get("url") or ""
+        text = ch.get("text") or ch.get("content") or ""
+
+        # Skip empty content
+        if not text:
+            continue
+
+        # Hard truncate each chunk to avoid very long pages dominating
+        snippet = text.strip()
+        if len(snippet) > 1200:
+            snippet = snippet[:1200] + "..."
+
+        block_lines = []
+        block_lines.append(f"Source {idx}: {title}")
+        if url:
+            block_lines.append(f"URL: {url}")
+        block_lines.append("")
+        block_lines.append(snippet)
+        block_lines.append("-" * 40)
+
+        block = "\n".join(block_lines)
+
+        if len(block) > remaining:
+            # If this block alone exceeds remaining budget, trim it
+            block = block[:remaining]
+            parts.append(block)
+            break
+
+        parts.append(block)
+        remaining -= len(block)
+
+        if remaining <= 0:
+            break
+
+    return "\n\n".join(parts)
+```
+
+This is purely a **context compressor**:
+
+* Takes already-reranked `chunks=results[:5]` from `chatbot_api.py`.
+* Limits total text to ~6000 characters.
+* Ensures you don’t stuff 50k tokens into the LLM every time.
+
+---
+
+## 2️⃣ Patch: new `generate_exigotech_answer` implementation
+
+Now we replace the old function.
+
+🔍 **Find your current**:
+
+```python
+async def generate_exigotech_answer(
+    chunks,
+    query,
+    links=None,
+    intent=None,
+):
+    ...
+```
+
+(or similar signature) in `exigotech_chatbot.py`.
+
+❌ **Delete the entire old body of that function.**
+
+✅ **Replace it with this:**
+
+```python
+import os
+import logging
+
+from openai import AsyncOpenAI  # or your existing Azure/OpenAI client
+
+logger = logging.getLogger(__name__)
+
+# You can adapt these env vars to your current setup
+MAIN_LLM_MODEL = os.getenv("MAIN_LLM_MODEL", "gpt-4.1-mini")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# If you already have a global client in this file, use that and remove this.
+_client: Optional[AsyncOpenAI] = None
+
+
+def _get_main_llm_client() -> AsyncOpenAI:
+    global _client
+    if _client is None:
+        _client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+    return _client
+
+
+async def generate_exigotech_answer(
+    chunks: List[Dict[str, Any]],
+    query: str,
+    links: Optional[List[str]] = None,
+    intent: Optional[str] = None,
+) -> str:
+    """
+    Generate the final Exigotech answer from reranked search chunks.
+
+    - Uses only the provided top-k chunks (already reranked).
+    - Builds a compact context string to reduce token usage.
+    - Asks the LLM to answer using ONLY this context.
+    - Still returns a single string (answer text).
+    - If your prompts.py already defines special instructions
+      (e.g. for 'relevant services' JSON at the end), you can
+      plug that prompt in place of the inline prompt below.
+    """
+    client = _get_main_llm_client()
+
+    # 1) Build compact context from chunks
+    context_str = _build_context_from_chunks(chunks, max_chars=6000)
+
+    # 2) Build system + user messages
+    # NOTE:
+    #  - You can later move these strings into prompts.py and
+    #    import them here. For now this keeps behavior simple.
+    #  - If you already have a SYSTEM_PROMPT in prompts.py, swap it in.
+    system_prompt = (
+        "You are Exigotech's AI assistant. "
+        "Answer the user's question using ONLY the supplied context. "
+        "If the context does not contain the answer, say you don't know "
+        "and suggest how the user might rephrase or what information is missing.\n\n"
+        "Be concise, structured, and business-friendly. "
+        "When explaining services or solutions, clearly highlight how "
+        "Exigotech helps the customer.\n\n"
+        "If relevant, you may mention which of the provided sources "
+        "you used (e.g., 'Based on Source 1 and Source 3')."
+    )
+
+    # You can later inject intent-specific instructions here
+    intent_str = (intent or "").lower().strip()
+    intent_hint = ""
+    if intent_str in {"contact"}:
+        intent_hint = (
+            "The user seems interested in contacting or talking to someone. "
+            "Answer normally, but it is okay to gently suggest next steps for contact."
+        )
+    elif intent_str in {"service", "page"}:
+        intent_hint = (
+            "The user is asking about services or web pages. "
+            "Summarize clearly what Exigotech offers for this topic."
+        )
+
+    user_content = f"""
+User question:
+{query}
+
+Intent hint (may be empty):
+{intent_hint}
+
+Context (multiple sources):
+{context_str}
+
+Instructions:
+- Use ONLY the information from the context above.
+- Do NOT invent services, contacts, or details that are not mentioned.
+- If something is unclear or missing, say so explicitly.
+- Write the answer in a natural, helpful tone, suitable for a website chatbot.
+"""
+
+    # 3) Call LLM
+    try:
+        response = await client.chat.completions.create(
+            model=MAIN_LLM_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=0.3,
+        )
+        answer = response.choices[0].message.content.strip()
+    except Exception as e:
+        logger.exception("generate_exigotech_answer failed: %s", e)
+        # Fallback text so API still returns something
+        answer = (
+            "I’m sorry, but I couldn’t generate an answer right now. "
+            "Please try again in a moment or rephrase your question."
+        )
+
+    return answer
+```
+
+### A few important notes:
+
+* **Signature is the same**:
+  `chunks, query, links=None, intent=None` → still matches your `chatbot_api.py`.
+
+* You already pass `chunks=results[:5]` from the API, so this function naturally uses the **top reranked results only**.
+
+* `links` is currently unused — that’s fine; we can later decide if we want LLM to see `useful_links` too.
+
+* We do **not** force any `{ "Service": "Question" }` JSON in this version.
+  Your existing prompts might have been doing that; we will reintroduce that at the **prompt engineering stage**, when you’re ready.
+
+  For now:
+
+  * Button JSON still works if your prompt already generates it.
+  * If not, we’ll tune that later once code is stable.
+
+* If you already have a custom client (Azure OpenAI, etc.), you can:
+
+  * Remove the `AsyncOpenAI` import and `_get_main_llm_client`.
+  * Replace the call with your existing `client.chat.completions.create(...)`.
+
+---
+
+## 3️⃣ How this reduces token usage (very concretely)
+
+Before:
+
+* You probably sent:
+
+  * Full history
+  * Full text chunks
+  * Possibly repeated prompts
+
+After this refactor:
+
+* Only **top 5 reranked chunks** (or fewer if you pass fewer).
+* Each chunk truncated to 1200 chars.
+* Total context capped at ~6000 characters.
+* Only one LLM call for the final answer.
+* No spammy URLs injected by the LLM — we keep links handling in `chatbot_api.py`.
+
+This is exactly the kind of “token diet” your TL wants.
+
+---
+
+## 4️⃣ What we’ll do later (after this works)
+
+Once you confirm this compiles and runs (even with very basic answers), we’ll:
+
+1. Plug your **prompts.py** into this function:
+
+   * So the answer has your exact required sections.
+   * So the LLM outputs `{service: question}` JSON at the end again.
+2. Tune prompts so:
+
+   * Contact offers are phrased consistently.
+   * “Related services” are generated predictably.
+   * You don’t pay extra tokens for unnecessary fluff.
+
+---
+
+If you hit any error (imports, AsyncOpenAI, env), just paste the traceback and I’ll adjust the patch for your exact setup.
+
+
+
+
