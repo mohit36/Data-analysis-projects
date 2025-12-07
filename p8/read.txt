@@ -1,411 +1,30 @@
-You’re right that *something* is off – but it’s not metadata, it’s the clarification logic.
-
-Look at your log:
-
-* Query: **“what are the services provided”** → intent **page**
-* Then: `Query needs clarification: Could you please specify which type of services you are referring to?`
-
-Same for:
-
-* “i am asking about services provided by exigotech”
-* “first you tell me services you have in your company!”
-* “i want to know more about artificial intelligence what is it?”
-
-In every case:
-
-1. **Intent classifier** says: `page`  ✅
-2. Then your **query-type classifier** (standalone / follow_up / under_specified) is marking these as **under_specified**.
-3. `process_query_with_context / hybrid_query_search` see `under_specified` and set `needs_clarification = True`, so the pipeline **returns a clarifying question instead of running RAG + generate_exigotech_answer**.
-4. So you *never reach* the metadata / page-intent prompt for these queries.
-
-That’s why you “never get the full answer” – the code is doing exactly what we told it: treat generic “services” questions as under-specified and ask “which service?”.
+Got you. Let’s do this the way your brain likes it: **file → exact spot → BEFORE / AFTER block**.
+No guessing, no “somewhere above”.
 
 ---
 
-## What we want instead
+## 1️⃣ File & helper function
 
-For Exigotech, generic “services” questions like:
+**File:** `code/chatbot_agents/chatbot_search_new.py`
 
-* “what are the services provided”
-* “what services do you offer”
-* “tell me the services you have”
-* “what are your core offerings”
+### 1.1. Find a place for the helper
 
-should **NOT** go to clarification.
-They should be treated as **standalone** questions and answered from the root services / core offerings pages.
-
-So we fix it in two layers:
-
----
-
-## 1. Fix the *prompt* for query_type_classification_prompt
-
-In `prompt_list.py`, inside `query_type_classification_prompt`, add an explicit rule so the LLM stops calling these “under_specified”.
-
-Add under **Classification Rules** (or similar section):
-
-```text
-Special rule for company services questions:
-- Queries like "what services do you offer?", "what are the services provided by Exigotech?", 
-  "tell me about your services", "what are your core offerings" MUST be classified as **standalone**, 
-  even if they do not mention a specific service name.
-- Do NOT classify these as under_specified or follow_up.
-```
-
-And add 1–2 examples in the *standalone* examples block:
-
-```text
-Examples:
-- "What services does Exigotech provide?" → standalone
-- "What are your core offerings?" → standalone
-```
-
-This alone should already reduce a lot of clarifications.
-
----
-
-## 2. Add a **hard override** in code (cheap, deterministic safety net)
-
-Because prompts can still wobble, we add a tiny helper that forces these queries to be treated as standalone even if the model mislabels them.
-
-In `chatbot_agents/chatbot_search_new.py` (where you run `query_type_classification_prompt` and then decide about clarification), add this helper somewhere near other utilities:
+Scroll near the top of `chatbot_search_new.py`, where you already have small helpers like:
 
 ```python
-def is_generic_services_question(query: str, intent: str | None) -> bool:
-    """
-    Detect queries like 'what services do you offer' that should be answered
-    with core offerings, not sent to clarification.
-    """
-    if not query:
-        return False
-
-    q = query.lower()
-
-    # Only care when we're in the "page" / services domain
-    if intent and intent != "page":
-        return False
-
-    patterns = [
-        "what are the services provided",
-        "what services do you offer",
-        "what services do you provide",
-        "what services does exigotech provide",
-        "tell me the services you have",
-        "tell me about your services",
-        "what are your core offerings",
-        "core offerings",
-    ]
-
-    if any(p in q for p in patterns):
-        return True
-
-    # Loose catch-all: contains 'services' or 'offerings' but not price/cost
-    if ("service" in q or "services" in q or "offering" in q or "offerings" in q) and \
-       ("price" not in q and "cost" not in q and "charges" not in q):
-        return True
-
-    return False
+def norm(s: str) -> str:
+    ...
 ```
 
-Then, **right after** you compute `query_intent` and `query_type` (inside `process_query_with_context` or wherever you call the query-type classifier), add:
+or anything similar (`compute_semantic_similarity_cached`, etc.).
 
-```python
-# After query_intent and query_type are set:
-
-if is_generic_services_question(original_query, query_intent):
-    # Force these to be treated as a clean, standalone services question.
-    if query_type != "standalone":
-        logger.info(
-            "Overriding query_type from %s to 'standalone' for generic services question: %s",
-            query_type,
-            original_query,
-            extra={"service": "chat"},
-        )
-    query_type = "standalone"
-```
-
-And in the place where you decide to ask for clarification (pseudo-code):
-
-```python
-needs_clarification = False
-
-if query_type == "under_specified":
-    needs_clarification = True
-    # ... generate clarification question ...
-```
-
-becomes:
-
-```python
-needs_clarification = False
-
-if query_type == "under_specified" and not is_generic_services_question(original_query, query_intent):
-    needs_clarification = True
-    # ... generate clarification question ...
-```
-
-So:
-
-* Generic services questions → **never** hit clarification, even if the LLM mislabels.
-* Truly vague stuff (“tell me more”, “what about it?”, “help”) still goes to clarification.
-
----
-
-## Why this is the root cause (tying back to your logs)
-
-Your log lines:
-
-> DB LOG FAIL: Query intent classified as: page
-> ❓ Query needs clarification: Could you please specify which type of services you are referring to?
-
-tell us:
-
-* **Intent = page** → correct.
-* But we immediately go into **“needs clarification”** branch → which is driven by `query_type == "under_specified"`.
-
-So we don’t even reach `generate_exigotech_answer` for those queries.
-Once you apply the two changes above, the flow for “what are the services provided?” should be:
-
-1. intent = `page`
-2. query_type = `standalone` (prompt + override)
-3. `needs_clarification = False`
-4. `hybrid_query_search` → vector search over services pages
-5. `generate_exigotech_answer` with your `page_intent_prompt`
-6. User sees **core offerings + sub-services + related services**, instead of “which services do you mean?”.
-
----
-
-If you want, next step after this fix we can:
-
-* Tune the `page_intent_prompt` a bit so it *always* prefers the root services/core-offerings page for these generic questions, and
-* Make sure we still ask clarification when user mixes services + pricing (“what services and how much do they cost”) instead of guessing.
-
-
-
-Nice catch, this is exactly the kind of “where does this logic *actually* bite?” question you should be asking.
-
-Short answer:
-
-* The **query-type classification (standalone / follow_up / under_specified)** should run **before vector search**, not after.
-* The **generic-services override** I suggested is *specifically* for **page-intent** questions (services / offerings).
-* The *pattern* can be reused for other intents (about, career, etc.), but you don’t want one giant rule that fires for everything.
-
-Let me break it down on your actual pipeline.
-
----
-
-## 1. Where the classification currently takes effect
-
-Your flow right now (for non-greeting / non-conclusion) is roughly:
-
-1. **Intent classifier**
-   `SearchAgent.classify_query_type(query)` → `intent`
-
-   * `greeting` / `conclusion` → go straight to `generate_exigotech_answer` with greeting/conclusion prompt (no RAG).
-   * else → continue.
-
-2. Call **`hybrid_query_search(...)`**
-   Inside that controller you do:
-
-   * Run **query_type classifier** (standalone / follow_up / under_specified) using `query_type_classification_prompt`.
-   * Possibly decontextualize if it’s follow_up.
-   * If **`under_specified`** → you *don’t even call vector search*; you return
-     `search_metadata["needs_clarification"] = True` and a clarification question.
-   * If **not under_specified** → then you run **pgvector search + rerank**, and only after that you go to `generate_exigotech_answer`.
-
-So:
-
-> “May be after having no results for vector search ? And before llm generation?”
-
-No – in your current design, **query-type classification gates the search itself**. It is *before* vector search and before answer generation.
-
-If you instead did:
-
-* always search,
-* and only if results are empty/weak, then ask clarification,
-
-you’d be doing an extra embedding + DB hit for lots of bad/vague questions. That’s slower and more expensive. The current design is correct:
-**filter obviously under-specified queries *before* wasting RAG.**
-
-We *can* add an **extra clarification** layer when search returns garbage, but that’s a *second* safety net, not a replacement.
-
----
-
-## 2. Is this only about `page` intent?
-
-The *override I gave* (`is_generic_services_question`) is intentionally restricted to `intent == "page"` because:
-
-* Those patterns are clearly “tell me about your services / offerings” → should hit **services pages**.
-* For **career**, **about**, **case**, the patterns are different.
-  You don’t want a “services” override polluting those.
-
-So:
-
-* 🔒 **Core logic (standalone/follow_up/under_specified)** is used for *all* intents that go through RAG (page, about, career, case, contact-info style, etc.)
-* 🛠 **Special override** for “generic services questions” is **only for `page`** because that’s exactly the use-case you’re fixing right now:
-  user asks “what services do you offer?”, you want:
-
-  * no clarification
-  * just a good answer based on the **root services/core offerings** pages.
-
-Later, you *can* add similar tiny helpers if you see problems like:
-
-* generic **career** question: “what jobs do you have?” → always treat as standalone career, not under_specified.
-* generic **about** question: “tell me about your company” → standalone about, not under_specified.
-
-But those should be separate, small, **intent-specific overrides**, not one giant rule that fires everywhere.
-
----
-
-## 3. Why not “only after no results”?
-
-You suggested:
-
-> “this classification really needs to takes effect ? May be after having no results for vector search ?”
-
-Problems if we do that:
-
-1. **Latency** – you still:
-
-   * embed query
-   * hit pgvector
-   * maybe rerank
-     just to find out “oh it was vague, now ask clarification”. That’s exactly the waste you’re trying to avoid.
-
-2. **No guarantee of ‘no results’** – pgvector will *always* return something if your DB is non-empty.
-   “What is it?” might pull some random page that happens to have high vector similarity.
-   You’d then *incorrectly* run `generate_exigotech_answer` on garbage, instead of admitting the question is underspecified.
-
-3. **You already have a designed place** for this:
-   `query_type == "under_specified"` → **ask clarifying question early**.
-
-So the right architecture is:
-
-1. intent classification (what kind of info?)
-2. query-type classification (how complete / follow-up?)
-3. **if under_specified → clarification**
-4. else → vector search + rerank
-5. then → `generate_exigotech_answer` with proper intent prompt.
-
-What we’re doing now is just tightening step 2–3 with intent-specific overrides so that “good” generic questions (like “what services do you offer?”) **don’t get stuck in clarification**.
-
----
-
-## 4. Where exactly to plug the override
-
-To ground it:
-
-* The **override** belongs inside your **context controller** (`process_query_with_context` / `hybrid_query_search`), right after you have **intent + query_type**, and **before** you decide `needs_clarification`.
-
-Conceptually:
-
-```python
-query_intent = classify_intent(...)
-query_type   = classify_query_type(...)
-
-# Intent-specific safety net
-if is_generic_services_question(original_query, query_intent):
-    query_type = "standalone"
-
-if query_type == "under_specified" and not is_generic_services_question(...):
-    # ask clarification
-else:
-    # proceed with search + answer
-```
-
-This way:
-
-* All intents still use the same clean logic.
-* Only **page+services** questions get the “never clarify, just answer from services pages” treatment.
-
----
-
-So, to answer your “am I wrong?”:
-
-* You were right to question *where* the classification should apply. It **must** be before search, not after “no results”.
-* You were mixing “page-services problem” with “all intents”. The *bug* you’re seeing right now is specific to **services questions**, so the fix is rightly `intent == "page"` + override.
-* The pattern (prompt rule + tiny override) is reusable for careers/about later, but we don’t generalize it blindly yet.
-
-If you want, next we can:
-
-* Add similar micro-overrides for **career** (“what job openings do you have?”) and **about** (“tell me about your company”) once you see them misclassified, and
-* Tune `page_intent_prompt` so it always prefers the root services page for those generic questions and only dives into sub-services when the user asks specifically.
-
-
-
-
-
-
-
-You’re 100% right to be annoyed by that behaviour.
-If the user asks *“what are the services provided?”* the bot must **just answer** (services overview), not start playing 20 questions.
-
-Right now the reason you see clarifications in the logs is:
-
-* Intent classifier → `page` ✅
-* **Query-type classifier** → `under_specified` ❌ (because it thinks “services” is too vague)
-* `hybrid_query_search` sees `under_specified` → sets `needs_clarification=True` → you get the annoying “which services…” question
-
-We fix this in two places so it’s reliable:
-
----
-
-## 1. Make the LLM explicitly treat generic service questions as STANDALONE
-
-In `prompt_list.py` for `query_type_classification_prompt`, make sure we have VERY explicit rules + examples like:
-
-```python
-query_type_classification_prompt = """
-You are a query analyzer for Exigotech chatbot.
-
-Classify the user query into exactly ONE of these types:
-1. "standalone"
-2. "follow_up"
-3. "under_specified"
-
-Rules summary:
-
-- Treat any generic question about Exigotech's services or offerings as **standalone**, even if no specific service name is mentioned.
-  Examples that MUST be "standalone":
-  - "what are the services provided"
-  - "what services do you offer"
-  - "what services does Exigotech provide"
-  - "tell me about your services"
-  - "what are your core offerings"
-  - "what solutions do you provide"
-
-- "follow_up":
-  - Query refers to earlier conversation (pronouns like he/she/it/they/that/this, "the above", "previous one", etc.)
-  - Needs previous Q/A to be understood.
-
-- "under_specified":
-  - Query is too vague to answer even if we assume it is about Exigotech.
-  - No clear subject, e.g. "what about it", "tell me more", "I want details" with no service/person/topic.
-
-Return ONLY the type: standalone, follow_up, or under_specified.
-No explanations, no extra text.
-"""
-```
-
-This alone will reduce a lot of bad “under_specified” labels.
-
----
-
-## 2. Add a hard override in code so those questions **never** trigger clarification
-
-Even with a good prompt, I don’t trust any LLM 100%. So we add a tiny, deterministic rule in **Python** that says:
-
-> If intent is `page` **and** the raw query clearly looks like “what services do you offer?” → **force `query_type="standalone"`** and skip clarification.
-
-### Step 2a – Add helper in `chatbot_search_new.py`
-
-Near the top of `chatbot_search_new.py` (with other helpers), add:
+👉 **Right below those helpers**, insert this new function **as-is**:
 
 ```python
 def is_services_overview_query(text: str) -> bool:
     """
-    Detect generic 'what services do you offer' type questions.
-    These should always be treated as standalone, not under-specified.
+    Detect generic service overview questions that should ALWAYS be treated as standalone.
+    These should never trigger clarification, even if vague.
     """
     if not text:
         return False
@@ -414,13 +33,13 @@ def is_services_overview_query(text: str) -> bool:
 
     patterns = [
         "what are the services provided",
+        "what are the services you provide",
         "what services do you provide",
         "what services do you offer",
         "what services does exigotech provide",
         "tell me about your services",
         "what are your services",
         "what are your core offerings",
-        "what are the core offerings",
         "what solutions do you provide",
         "what solutions do you offer",
         "what are the solutions you provide",
@@ -429,79 +48,131 @@ def is_services_overview_query(text: str) -> bool:
     return any(p in t for p in patterns)
 ```
 
-### Step 2b – Use it inside your context controller
-
-Find the place in `hybrid_query_search` (or `process_query_with_context`, depending on your version) where you:
-
-* already have `query_intent` (from `SearchAgent`)
-* call the query-type classifier and get `query_type`
-* decide whether to ask clarification or not
-
-It’ll look roughly like:
-
-```python
-query_type = await classify_query_type_llm(query)
-
-if query_type == "under_specified":
-    # build clarification question
-    search_metadata["needs_clarification"] = True
-    search_metadata["clarification_question"] = ...
-    return query, [], search_metadata
-```
-
-Right **before** you check for `under_specified`, inject:
-
-```python
-# Hard override: services overview questions should never be treated as under_specified.
-if isinstance(query_intent, str) and query_intent.lower() == "page":
-    if is_services_overview_query(original_query or query):
-        query_type = "standalone"
-```
-
-So the whole block ends up like:
-
-```python
-query_type = await classify_query_type_llm(query)
-
-# Hard override for generic services questions on page intent
-if isinstance(query_intent, str) and query_intent.lower() == "page":
-    if is_services_overview_query(original_query or query):
-        query_type = "standalone"
-
-if query_type == "under_specified":
-    # ask clarification instead of RAG
-    search_metadata["needs_clarification"] = True
-    search_metadata["clarification_question"] = clarification_question
-    return query, [], search_metadata
-```
-
-> **Key point:** we only override when
-> `intent == "page"` **AND** the raw text matches our patterns.
-> Everything else still uses your clean follow_up / under_specified logic.
+Nothing else to touch in this step.
 
 ---
 
-## What this guarantees
+## 2️⃣ Override the “under_specified → clarification” logic
 
-With those two changes:
+**Same file:** `code/chatbot_agents/chatbot_search_new.py`
+**Function:** `hybrid_query_search(...)` (your main RAG entry in this file).
 
-* **“what are the services provided”**
-* **“what services do you offer”**
-* **“tell me about your services”**
+### 2.1. Find the existing clarification block
 
-will always:
+Inside `hybrid_query_search`, scroll until you see something like this (wording may differ a bit, but the structure is like):
 
-1. classify as `intent="page"`,
-2. be forced to `query_type="standalone"`,
-3. go straight into: history-filter → vector search → rerank → `generate_exigotech_answer` (page-intent prompt),
-4. no clarification step.
+```python
+    # classify query type
+    query_type = await classify_query_type_llm(processed_query_text)
 
-Clarification is kept only for *truly* bad questions like:
+    if query_type == "under_specified":
+        search_metadata["needs_clarification"] = True
+        search_metadata["clarification_question"] = clarifying_question
+        return processed_query_text, [], search_metadata
+```
 
-* “tell me more” (after some answer, with no subject)
-* “what about that”
-* “can you explain more” (no target)
+or maybe:
 
-Those are the ones that actually need, “Which service / person are you asking about?”.
+```python
+    query_type = await classify_query_type_llm(query_for_type)
 
-If you show me the exact block around your `query_type` handling in `chatbot_search_new.py`, I can wire this override into your real code instead of pseudo-code.
+    if query_type == "under_specified":
+        search_metadata["needs_clarification"] = True
+        search_metadata["clarification_question"] = clarification_question
+        return rewritten_query, [], search_metadata
+```
+
+**This `if query_type == "under_specified": ...` block is what we’re replacing.**
+
+---
+
+### 2.2. Replace that whole block with this version
+
+**BEFORE (what you have now):**
+
+```python
+    query_type = await classify_query_type_llm(processed_query_text)
+
+    if query_type == "under_specified":
+        search_metadata["needs_clarification"] = True
+        search_metadata["clarification_question"] = clarifying_question
+        return processed_query_text, [], search_metadata
+```
+
+**AFTER (what you should paste instead):**
+
+```python
+    # 1) Classify query type as usual
+    query_type = await classify_query_type_llm(processed_query_text)
+
+    # 2) Hard override for “what services do you provide?” type questions.
+    #    If intent is page + text matches our patterns, FORCE standalone.
+    if isinstance(query_intent, str) and query_intent.lower() == "page":
+        # original_query is the raw user query if you have it;
+        # if not, processed_query_text alone is fine.
+        raw_text = original_query or processed_query_text
+        if is_services_overview_query(raw_text):
+            query_type = "standalone"
+
+    # 3) Only if still under_specified do we ask for clarification.
+    if query_type == "under_specified":
+        search_metadata["needs_clarification"] = True
+        search_metadata["clarification_question"] = clarifying_question
+        return processed_query_text, [], search_metadata
+```
+
+> ⚠️ If your variables are named slightly differently (e.g. `rewritten_query`, `clarification_question` vs `clarifying_question`), just keep your existing names and only change the logic.
+
+So **in plain language**:
+
+* **Leave everything above this block exactly as it is** (contextualization, history filtering, etc.).
+* **Leave everything below this block exactly as it is** (vector search, reranking, answer generation).
+* Just replace **the single `if query_type == "under_specified": ...` section** with the new version above.
+
+---
+
+## 3️⃣ What if you don’t have `query_intent` or `original_query` inside this function?
+
+If inside `hybrid_query_search` you **don’t** have `query_intent` yet, or you didn’t pass `original_query`, then use this slightly adjusted version.
+
+### 3.1. Minimal version (no `query_intent` check)
+
+Replace your block with:
+
+```python
+    query_type = await classify_query_type_llm(processed_query_text)
+
+    # Hard override: treat generic “what services do you provide” as standalone.
+    # This prevents stupid clarifications for obvious service overview questions.
+    if is_services_overview_query(processed_query_text):
+        query_type = "standalone"
+
+    if query_type == "under_specified":
+        search_metadata["needs_clarification"] = True
+        search_metadata["clarification_question"] = clarifying_question
+        return processed_query_text, [], search_metadata
+```
+
+This still solves your real-world problem:
+
+> *“what are the services provided?”* → **directly to RAG + answer**, no clarification.
+
+---
+
+## 4️⃣ Quick sanity checklist (so you know it’s wired correctly)
+
+After you edit:
+
+1. `chatbot_search_new.py` contains the new function `is_services_overview_query`.
+2. There is **exactly one** `if query_type == "under_specified":` in `hybrid_query_search`.
+3. Above that `if`, you now see the `is_services_overview_query` override.
+4. You did **not** touch `chatbot_api.py` for this change.
+
+---
+
+If you want, paste the `hybrid_query_search` function here (just that function), and I’ll mark your **exact lines** and clean it up into the final “production-grade” version with:
+
+* history usage,
+* clarification,
+* services override,
+* and minimal tokens.
