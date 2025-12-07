@@ -1,3 +1,187 @@
+You’re right that *something* is off – but it’s not metadata, it’s the clarification logic.
+
+Look at your log:
+
+* Query: **“what are the services provided”** → intent **page**
+* Then: `Query needs clarification: Could you please specify which type of services you are referring to?`
+
+Same for:
+
+* “i am asking about services provided by exigotech”
+* “first you tell me services you have in your company!”
+* “i want to know more about artificial intelligence what is it?”
+
+In every case:
+
+1. **Intent classifier** says: `page`  ✅
+2. Then your **query-type classifier** (standalone / follow_up / under_specified) is marking these as **under_specified**.
+3. `process_query_with_context / hybrid_query_search` see `under_specified` and set `needs_clarification = True`, so the pipeline **returns a clarifying question instead of running RAG + generate_exigotech_answer**.
+4. So you *never reach* the metadata / page-intent prompt for these queries.
+
+That’s why you “never get the full answer” – the code is doing exactly what we told it: treat generic “services” questions as under-specified and ask “which service?”.
+
+---
+
+## What we want instead
+
+For Exigotech, generic “services” questions like:
+
+* “what are the services provided”
+* “what services do you offer”
+* “tell me the services you have”
+* “what are your core offerings”
+
+should **NOT** go to clarification.
+They should be treated as **standalone** questions and answered from the root services / core offerings pages.
+
+So we fix it in two layers:
+
+---
+
+## 1. Fix the *prompt* for query_type_classification_prompt
+
+In `prompt_list.py`, inside `query_type_classification_prompt`, add an explicit rule so the LLM stops calling these “under_specified”.
+
+Add under **Classification Rules** (or similar section):
+
+```text
+Special rule for company services questions:
+- Queries like "what services do you offer?", "what are the services provided by Exigotech?", 
+  "tell me about your services", "what are your core offerings" MUST be classified as **standalone**, 
+  even if they do not mention a specific service name.
+- Do NOT classify these as under_specified or follow_up.
+```
+
+And add 1–2 examples in the *standalone* examples block:
+
+```text
+Examples:
+- "What services does Exigotech provide?" → standalone
+- "What are your core offerings?" → standalone
+```
+
+This alone should already reduce a lot of clarifications.
+
+---
+
+## 2. Add a **hard override** in code (cheap, deterministic safety net)
+
+Because prompts can still wobble, we add a tiny helper that forces these queries to be treated as standalone even if the model mislabels them.
+
+In `chatbot_agents/chatbot_search_new.py` (where you run `query_type_classification_prompt` and then decide about clarification), add this helper somewhere near other utilities:
+
+```python
+def is_generic_services_question(query: str, intent: str | None) -> bool:
+    """
+    Detect queries like 'what services do you offer' that should be answered
+    with core offerings, not sent to clarification.
+    """
+    if not query:
+        return False
+
+    q = query.lower()
+
+    # Only care when we're in the "page" / services domain
+    if intent and intent != "page":
+        return False
+
+    patterns = [
+        "what are the services provided",
+        "what services do you offer",
+        "what services do you provide",
+        "what services does exigotech provide",
+        "tell me the services you have",
+        "tell me about your services",
+        "what are your core offerings",
+        "core offerings",
+    ]
+
+    if any(p in q for p in patterns):
+        return True
+
+    # Loose catch-all: contains 'services' or 'offerings' but not price/cost
+    if ("service" in q or "services" in q or "offering" in q or "offerings" in q) and \
+       ("price" not in q and "cost" not in q and "charges" not in q):
+        return True
+
+    return False
+```
+
+Then, **right after** you compute `query_intent` and `query_type` (inside `process_query_with_context` or wherever you call the query-type classifier), add:
+
+```python
+# After query_intent and query_type are set:
+
+if is_generic_services_question(original_query, query_intent):
+    # Force these to be treated as a clean, standalone services question.
+    if query_type != "standalone":
+        logger.info(
+            "Overriding query_type from %s to 'standalone' for generic services question: %s",
+            query_type,
+            original_query,
+            extra={"service": "chat"},
+        )
+    query_type = "standalone"
+```
+
+And in the place where you decide to ask for clarification (pseudo-code):
+
+```python
+needs_clarification = False
+
+if query_type == "under_specified":
+    needs_clarification = True
+    # ... generate clarification question ...
+```
+
+becomes:
+
+```python
+needs_clarification = False
+
+if query_type == "under_specified" and not is_generic_services_question(original_query, query_intent):
+    needs_clarification = True
+    # ... generate clarification question ...
+```
+
+So:
+
+* Generic services questions → **never** hit clarification, even if the LLM mislabels.
+* Truly vague stuff (“tell me more”, “what about it?”, “help”) still goes to clarification.
+
+---
+
+## Why this is the root cause (tying back to your logs)
+
+Your log lines:
+
+> DB LOG FAIL: Query intent classified as: page
+> ❓ Query needs clarification: Could you please specify which type of services you are referring to?
+
+tell us:
+
+* **Intent = page** → correct.
+* But we immediately go into **“needs clarification”** branch → which is driven by `query_type == "under_specified"`.
+
+So we don’t even reach `generate_exigotech_answer` for those queries.
+Once you apply the two changes above, the flow for “what are the services provided?” should be:
+
+1. intent = `page`
+2. query_type = `standalone` (prompt + override)
+3. `needs_clarification = False`
+4. `hybrid_query_search` → vector search over services pages
+5. `generate_exigotech_answer` with your `page_intent_prompt`
+6. User sees **core offerings + sub-services + related services**, instead of “which services do you mean?”.
+
+---
+
+If you want, next step after this fix we can:
+
+* Tune the `page_intent_prompt` a bit so it *always* prefers the root services/core-offerings page for these generic questions, and
+* Make sure we still ask clarification when user mixes services + pricing (“what services and how much do they cost”) instead of guessing.
+
+
+
 Nice catch, this is exactly the kind of “where does this logic *actually* bite?” question you should be asking.
 
 Short answer:
