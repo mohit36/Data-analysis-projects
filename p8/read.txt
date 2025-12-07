@@ -1,716 +1,347 @@
-Perfect, let’s wire the **session reset** properly first, then we’ll attack `prompts.py`.
+Good, this is exactly the right moment to clean it up 😎
+Let’s start **systematically** instead of randomly deleting stuff.
 
-I’ll give you **small, surgical patches** you can drop in.
+I’ll do this in **phases** so you’re never blind:
 
----
+1. **Decide the final prompt set (what exists, what dies).**
+2. **Today’s step = give you a clean, optimized block for:**
 
-## 1️⃣ Add `clear_session_history` in `session_memory_pgvector.py`
-
-Open:
-`pgvector_helper/session_memory_pgvector.py`
-
-Right now you already have things like:
-
-```python
-async def save_message(...):
-    ...
-
-async def get_recent_history(...):
-    ...
-
-async def get_msg_count(...):
-    ...
-```
-
-👉 **Add this new function at the bottom** (and adapt the DB bits to your setup):
-
-```python
-# pgvector_helper/session_memory_pgvector.py
-
-async def clear_session_history(session_id: str) -> None:
-    """
-    Delete all stored messages for a given session.
-    Used when a conversation is logically 'ended',
-    e.g., after completing a contact flow or when user resets the chat.
-    """
-    if not session_id:
-        return
-
-    # 🔧 Replace this with your actual DB access logic.
-    # Example if you're using asyncpg directly:
-    #
-    # conn = await get_pg_connection()
-    # async with conn.transaction():
-    #     await conn.execute("DELETE FROM chat_history WHERE session_id = $1", session_id)
-    #
-    # Or if you have a helper/Repository, call that instead.
-
-    try:
-        from pgvector_helper.db_connection import get_pg_connection  # if you have something like this
-
-        conn = await get_pg_connection()
-        async with conn.transaction():
-            await conn.execute(
-                "DELETE FROM chat_history WHERE session_id = $1",
-                session_id,
-            )
-    except Exception as e:
-        # Don't let this crash the API – log and move on
-        import logging
-
-        logging.getLogger(__name__).warning(
-            "Failed to clear session history for %s: %s", session_id, e
-        )
-```
-
-⚠️ **Important:**
-You *must* replace the `get_pg_connection` / SQL with whatever you already use to talk to Postgres. The shape is just an example.
+   * intent classifier
+   * query type classifier
+   * decontextualization
+   * clarification (under-specified + follow-up)
+   * greeting + conclusion responses
+3. Next step (after you paste this): we’ll simplify all the big answer prompts
+   (contact / about / page / case / career + related services JSON).
 
 ---
 
-## 2️⃣ Add `reset_session_state` helper in `chatbot_api.py`
+## 1️⃣ Final prompt set I recommend
 
-In `chatbot_api.py`, you already import:
+These are the **only prompts you actually need** long-term:
 
-```python
-from pgvector_helper.session_memory_pgvector import (
-    save_message,
-    get_recent_history,
-    get_msg_count,
-)
-```
+### A. Classification + orchestration
 
-👉 Change this import to also include the new function:
+Keep (we’ll rewrite them):
 
-```python
-from pgvector_helper.session_memory_pgvector import (
-    save_message,
-    get_recent_history,
-    get_msg_count,
-    clear_session_history,  # <--- add this
-)
-```
-
-Then, somewhere near your other helpers (after `service_mapping_store` + `get_session_state` is a good spot), add:
-
-```python
-async def reset_session_state(sid: str) -> None:
-    """
-    Hard reset for a session:
-    - Clear DB-backed history (Postgres)
-    - Clear in-memory mapping of buttons / related services
-    """
-    if not sid:
-        return
-
-    # Clear per-session mapping for related-services / buttons
-    service_mapping_store.pop(sid, None)
-
-    # Clear DB history so future queries start "fresh"
-    await clear_session_history(sid)
-```
-
-Now you have a clean “kill switch” for a conversation.
-
----
-
-## 3️⃣ Call it in the **contact YES branch**
-
-You already have the contact follow-up flow wired roughly like:
-
-* Detect if last assistant message was a contact offer
-* Classify user reply with `classify_contact_reply` / `llm_contact_reply_classifier`
-* If label == `"YES"` → build contact query, run RAG, call `generate_exigotech_answer(intent="contact")`, return contact info.
-
-Inside that **YES branch**, after you’ve generated the contact answer and before you `return`, call `reset_session_state(sid)` and expose that to the frontend.
-
-Here’s a generic pattern you can adapt into your existing YES branch:
-
-```python
-if label == "YES":
-    # 1) Prefer explicit service name if available
-    service_name = state.get("last_service_name")
-    if service_name:
-        query = f"How can I contact {os.getenv('COMPANY_NAME', 'Exigotech')} sales team about {service_name}?"
-    else:
-        query = f"How can I contact {os.getenv('COMPANY_NAME', 'Exigotech')} sales team about this service?"
-
-    # 2) Run RAG contact search
-    session_history_snapshot = await get_history_snapshot(sid)
-    processed_query, results, search_metadata = await hybrid_query_search(
-        query=query,
-        history=session_history_snapshot,
-        top_k=5,
-        request_url=str(request.url),
-        country_code=country_code,
-    )
-
-    contact_answer = await generate_exigotech_answer(
-        chunks=results[:5],
-        query=processed_query,
-        links=None,
-        intent="contact",
-    )
-
-    # 3) Persist final contact answer for this conversation segment
-    await push_user(sid, payload.query)
-    await push_assistant_sanitized(sid, contact_answer)
-
-    # 4) Extract useful links if you want
-    result_urls = _extract_result_urls(results)
-    useful_links = list(result_urls)[:5]
-
-    # 5) 🔥 HARD RESET SESSION CONTEXT (but keep chat visible in UI)
-    await reset_session_state(sid)
-
-    # 6) Let frontend know this conversation is "closed"
-    return {
-        "summary": contact_answer,
-        "useful_links": useful_links,
-        "mapped_questions": {},   # no more buttons after hard contact
-        "needs_clarification": False,
-        "session_reset": True,    # <--- frontend can use this
-    }
-```
-
-You don’t have to copy this whole block if your YES branch is already there – just:
-
-* Make sure `await reset_session_state(sid)` is called near the end.
-* Add `"session_reset": True` to the returned JSON shape for that path.
-
-The key idea:
-
-* History + mappings get cleared in backend,
-* The user **still sees the entire conversation in UI**,
-* Next user message is logically a *brand new* topic.
-
----
-
-## 4️⃣ What your frontend should do with `session_reset`
-
-Once this is in place, your API will sometimes return:
-
-```json
-{
-  "summary": "...",
-  "useful_links": [...],
-  "mapped_questions": {},
-  "needs_clarification": false,
-  "session_reset": true
-}
-```
-
-Your UI can then:
-
-* Show a small system message like:
-
-  > “✅ This conversation has been completed. You can start a new topic now.”
-* Maybe visually separate with a divider or “New conversation” chip.
-* But **do not wipe** the old bubbles — just treat future queries as fresh (backend already does that).
-
-You get **ChatBot.com behavior**:
-– old chat visible,
-– new topic = fresh mental state.
-
----
-
-Once you’ve wired this and it compiles, we’ll jump to the fun part next:
-**cleaning and optimizing `prompts.py` for speed, cost, and strict Exigotech-only knowledge.**
-
-When you’re ready, paste your current `prompts.py` (or the main prompt definitions), and I’ll start cutting, tightening, and adding the env-driven `{COMPANY_NAME}` pattern you asked for.
-
-
-
-Perfect — I see the **exact code block** you pasted from my instructions, and yes, there is **ONE CRITICAL FIX** you must apply immediately:
-
----
-
-# ✅ **Your bug: `reset_session(sid)` does NOT exist**
-
-You must rename it to the actual function name we created:
-
-### ✔ Correct function name:
-
-```python
-await reset_session_state(sid)
-```
-
-You currently have:
-
-```python
-await reset_session(sid)
-```
-
-This will raise:
-
-```
-NameError: reset_session is not defined
-```
-
-So update **only that line**:
-
----
-
-# ✅ **Patch (drop-in fix)**
-
-Find this block:
-
-```python
-# 5) Reset session completely
-await reset_session(sid)
-```
-
-Replace with:
-
-```python
-# 5) Reset session completely
-await reset_session_state(sid)
-```
-
----
-
-# 🔍 **Double-check: Did you import it correctly?**
-
-At the top of `chatbot_api.py`, you must have:
-
-```python
-from pgvector_helper.session_memory_pgvector import (
-    save_message,
-    get_recent_history,
-    get_msg_count,
-    clear_session_history,
-)
-```
-
-And also:
-
-```python
-async def reset_session_state(sid: str) -> None:
-    ...
-```
-
-If all that is in place, this branch will now work perfectly.
-
----
-
-# 🧠 **Why this matters**
-
-Without this fix:
-
-* YES → contact flow works
-* but backend crashes at reset step
-* frontend gets no JSON
-* chat appears frozen or dies
-
-After the fix:
-
-* The contact flow completes
-* History is cleared
-* UI shows previous chat
-* New message = new session context
-
-Exactly like ChatBot.com.
-
----
-
-# 📌 Quick checklist before we move to `prompts.py`
-
-### Must be true before next step:
-
-| Item                                               | Status              |
-| -------------------------------------------------- | ------------------- |
-| `reset_session_state` exists                       | ✅                   |
-| `clear_session_history` implemented in PG helper   | ✅                   |
-| Correct import in chatbot_api                      | ⚠ verify            |
-| Contact YES branch uses `reset_session_state(sid)` | ⬅ apply the fix     |
-| JSON returns `session_reset` or `session_ended`    | You already do this |
-
----
-
-# 🚀 After this fix, you can send me `prompts.py`
-
-And then:
-
-* I will optimize each prompt
-* Remove redundant instructions
-* Make everything env-driven (`COMPANY_NAME`)
-* Reduce token cost
-* Improve consistency
-* Add safe fallbacks
-* Add caching strategies (per prompt)
-* Ensure fast models can handle lightweight prompts
-
-Your bot will become **fast like ChatBot.com but far more accurate**.
-
----
-
-💬 **Send `prompts.py` now and I’ll refactor it.**
-
-
-
-
-
-
-
-Good, this is *exactly* the stage where cleaning up pays off in speed and cost. Let’s be ruthless but sensible, not just delete things randomly.
-
-I’ll break it into two parts:
-
-1. **What to keep / delete / merge in `prompt_list.py` right now**
-2. **Concrete short versions for the heavy prompts (patches you can paste)**
-
----
-
-## 1️⃣ What to keep vs delete / merge
-
-From your screenshots I can see these major prompt blocks in `prompt_list.py`:
-
-### A. Intent classification
-
-You currently have **two** intent classifiers:
-
-1. `intent_classification_prompt`
-2. `main_intent_classifier`
-   (with the comment `#currently using this one`)
-
-**Decision:**
-
-* ✅ **KEEP:** `main_intent_classifier`
-* ❌ **DELETE:** `intent_classification_prompt`
-
-They do the same job with slightly different wording. Two separate big prompts = more confusion and wasted tokens. Your code should only ever call **one** classifier.
-
-Action for you:
-
-* In the whole repo, search for `intent_classification_prompt`.
-
-  * If nothing uses it → delete that whole block from `prompt_list.py`.
-  * If something still uses it → change that usage to `main_intent_classifier`, then delete the old one.
-
----
-
-### B. Query type classification
-
+* `main_intent_classifier`
 * `query_type_classification_prompt`
-  (classifies into `standalone`, `follow_up`, `under_specified`)
-
-**Decision:**
-
-* ✅ **KEEP, but shorten** – this one is important for your “under-specified → clarification” logic.
-* We will trim the text and keep only:
-
-  * 1–2 bullet rules for each type
-  * 2–3 short examples
-  * a strict “return ONLY this label” instruction.
-
-Patch is below in section 2.
-
----
-
-### C. Decontextualization
-
 * `query_decontextualization_prompt`
-  (rewrites using history, expands abbreviations, etc.)
-
-**Decision:**
-
-* ✅ **KEEP, but shorten.**
-  The *behaviour* is correct for your architecture:
-
-  * use history only when needed;
-  * expand abbreviations (MD → Managing Director, etc.);
-  * keep query standalone.
-
-We’ll compress wording + examples to reduce tokens but not logic.
-
----
-
-### D. Clarification prompts
-
-You have:
-
 * `clarification_underspecified_prompt`
 * `clarification_followup_prompt`
 
-**Decision:**
+Delete / deprecate:
 
-* ✅ **KEEP both, but simplify.**
-  They map nicely to your “query_type = under_specified” and “query_type = follow_up but missing context” paths.
+* old `intent_classification_prompt` (the earlier version above `main_intent_classifier`)
+* `trail_query_rewriting_prompt`
+* `contextualize_query_rewrite_prompt`
+* `llm_contact_label_prompt` (replaced by `micro_llm.py`)
+* any other “query rewrite” / “trail rewriting” prompts you’re not explicitly calling
 
-What we do:
+### B. Greeting / goodbye
 
-* Keep *one* clear example block per prompt.
-* Shorten instructions + remove redundant sentences.
-
----
-
-### E. Greeting / conclusion / page / case / contact / about / career prompts
-
-From earlier:
+Keep (we’ll rewrite them):
 
 * `greeting_response_prompt`
 * `conclusion_response_prompt`
+
+Delete:
+
+* `greeting_and_conclusion_merged_prompt`
+* any “old_*_prompt” for greeting/conclusion
+
+### C. RAG answer prompts (we’ll handle in the *next round*)
+
+Keep (to be optimized next):
+
 * `contact_intent_prompt`
 * `about_intent_prompt`
 * `career_intent_prompt`
-* `page_intent_prompt` / `page_intent_prompt_improved`
+* `page_intent_prompt_improved` (or we’ll rename your best one to this)
 * `case_intent_prompt`
 
-**Decision:**
+Delete / deprecate later:
 
-* ✅ **KEEP only the versions you actually call from `exigotech_chatbot.py`.**
-* ❌ **Delete older duplicates.**
-
-Concretely:
-
-1. Open `exigotech_chatbot.py`.
-
-2. At top you import:
-
-   ```python
-   from prompt_list import (
-       greeting_response_prompt,
-       conclusion_response_prompt,
-       contact_intent_prompt,
-       about_intent_prompt,
-       career_intent_prompt,
-       page_intent_prompt,
-       case_intent_prompt,
-       page_intent_prompt_improved,
-   )
-   ```
-
-3. Inside `run_exigotech_prompt`, you currently pick the prompt based on `intent`.
-   **Keep only those prompt variables that are imported + used in that function.**
-
-4. Anything in `prompt_list.py` that isn’t:
-
-   * imported anywhere, **and**
-   * not referenced in any `.py` file
-     → safe to delete.
-
-So: run “Find in Files” in VS Code for each prompt name. If count = 1 (definition only), delete it.
+* `contact_old_prompt`, `about_old_prompt`, `career_old_prompt`
+* `general_used_to_be_fallback_and_page_prompt`
+* other “old_*” variants
 
 ---
 
-## 2️⃣ Shorter, cheaper versions of the heavy prompts
+## 2️⃣ Drop-in replacement: core prompts (paste into prompts.py)
 
-Here are replacement blocks you can paste directly into `prompt_list.py`
-(overwrite the existing ones).
-
-### 2.1 `main_intent_classifier` (single intent classifier)
+At the **top of `prompts.py`**, add this small config so we don’t hardcode Exigotech everywhere:
 
 ```python
-main_intent_classifier = """
-You are a query intent classifier for the Exigotech chatbot.
+import os
 
-Classify the user query into EXACTLY ONE of these intents:
+COMPANY_NAME = os.getenv("COMPANY_NAME", "Exigotech")
+ASSISTANT_NAME = os.getenv("ASSISTANT_NAME", f"{COMPANY_NAME} AI assistant")
+```
+
+Now replace your **current blocks for these prompts** with the ones below.
+
+> ✅ You can safely overwrite the old versions of
+> `main_intent_classifier`, `query_type_classification_prompt`,
+> `query_decontextualization_prompt`, `clarification_underspecified_prompt`,
+> `clarification_followup_prompt`, `greeting_response_prompt`,
+> `conclusion_response_prompt`.
+
+---
+
+### A. Intent classifier (greeting/contact/about/page/case/etc.)
+
+```python
+main_intent_classifier = f"""
+You are a query intent classifier for {COMPANY_NAME}'s website chatbot.
+
+Classify the user query into exactly ONE of these intents:
 - greeting
 - conclusion
-- contact        (pricing, quotes, licenses, renewals, purchases, support/help, how to reach company or sales)
-- about          (people, roles, leadership, org structure, careers at company)
-- career         (jobs, hiring, recruitment, positions)
-- page           (services, capabilities, topics, blogs, articles, general info about offerings)
-- case           (case studies, success stories, testimonials)
+- contact
+- about
+- career
+- page
+- case
 
-Rules (short):
+Definitions (decide based on the MAIN question, not small talk words):
 
-1) greeting
-   - Only if it’s JUST a greeting (“hi”, “hello”, “hey”).
-   - If greeting + question → classify by the question, NOT greeting.
+1. greeting
+   - Pure greeting or small talk without a clear information request.
+   - Examples: "hi", "hello", "hey", "good morning", "how are you?"
 
-2) conclusion
-   - Only if clearly ending the chat (“bye”, “thank you, bye”, “that’s all, thanks”).
+2. conclusion
+   - User clearly closing the conversation.
+   - Examples: "bye", "thank you, that's all", "thanks, I'm done", "no more questions".
 
-3) contact
-   - Only when user asks about contact information, sales team, support team, pricing, cost, quote, demo, renewal, or “talk to a person”.
-   - Example: “How do I contact sales?”, “What does Exigotech charge for cloud security?”, “I want a demo”.
+3. contact
+   - User wants to reach the company or a person at the company OR needs help / support.
+   - Includes: pricing, cost, quotes, licensing, renewals, purchases, demos, support, help.
+   - Includes queries like "how do I contact you", "can I talk to sales", "support number".
+   - If the main focus is getting in touch, classify as contact.
 
-4) about
-   - Questions about people or org: CEO, leadership, team, roles, departments, company background.
-   - Example: “Who is in sales team?”, “Who is the CEO?”, “Tell me about the leadership team”.
+4. about
+   - Query about people, roles, team, leadership, departments, or company info.
+   - Examples: "who is the CEO", "tell me about your leadership team",
+     "what does your company do", "who is in the sales team".
 
-5) career
-   - Jobs, openings, applying, hiring, recruitment.
-   - Example: “Any software engineer jobs?”, “How can I apply?”.
+5. career
+   - Job applications, hiring, recruitment, internships, positions, interviews.
+   - Examples: "open positions", "how can I apply", "careers at your company".
 
-6) page
-   - General info about services/solutions, topics, offerings, blogs, articles.
-   - Example: “What services does Exigotech provide?”, “Show me your AI services”.
+6. page
+   - User wants general information about services, solutions, offerings, topics or pages.
+   - Examples: "what services do you offer", "show me your cloud services",
+     "what are your core offerings", "tell me about your security solutions".
 
-7) case
-   - Case studies, success stories, client stories, testimonials.
-   - Example: “Show me cloud security success stories”.
+7. case
+   - Case studies, success stories, client stories, testimonials, customer results.
 
-Disambiguation:
-- If query is about prices/support/contact → contact.
-- If query is about people / roles / org → about.
-- If query is about services or solutions, not price/support → page.
+Disambiguation rules:
+- If the query is mainly about contacting or pricing/support → contact.
+- If the query is about people, roles, leadership, team → about.
+- If the query is explicitly about jobs or hiring → career.
+- If the query is about services/solutions/offerings without clear contact intent → page.
+- If the query is clearly about case studies or success stories → case.
+- Greetings together with a real question → classify based on the question, NOT greeting.
+- Short "thanks" without a new question at the end → conclusion.
 
-Return ONLY one word:
-greeting, conclusion, contact, about, career, page, or case.
-No quotes or extra text.
+Return ONLY one word: greeting, conclusion, contact, about, career, page, or case.
+No quotes, no explanation, no extra text.
 """
 ```
 
-Delete the old `intent_classification_prompt` block entirely.
-
 ---
 
-### 2.2 `query_type_classification_prompt`
+### B. Query type classifier (standalone / follow_up / under_specified)
 
 ```python
-query_type_classification_prompt = """
-You are a query type analyzer for the Exigotech chatbot.
+query_type_classification_prompt = f"""
+You are a query analyzer for {COMPANY_NAME}'s chatbot.
 
-Classify the user query into EXACTLY ONE type:
+Classify the user query into exactly ONE of these types:
 
-1) "standalone"
-   - Complete on its own, with clear subject.
-   - Does NOT depend on previous conversation.
+1. "standalone"
+   - Query is complete with clear subject and context.
+   - Can be answered WITHOUT using previous conversation.
    - Examples:
-     - "Who is the CEO of Exigotech?"
-     - "What cloud services does Exigotech offer?"
+     - "Who is the CEO of {COMPANY_NAME}?"
+     - "What cloud services does {COMPANY_NAME} offer?"
      - "Show me case studies about AI solutions."
 
-2) "follow_up"
-   - Refers to previous conversation using pronouns or vague references.
-   - Needs recent history to understand.
+2. "follow_up"
+   - Query depends on previous conversation or context.
+   - Uses pronouns or vague references like "he", "she", "it", "they", "that", "this",
+     "those", "the above", "what about that", "the same service".
    - Examples:
-     - "How old is he?" (after asking about a person)
-     - "What’s the pricing for it?" (after a service was mentioned)
-     - "Can you explain this in detail?" (refers to previous topic).
+     - "How old is he?" (about a person mentioned earlier)
+     - "What’s the pricing for it?" (refers to a service mentioned before)
+     - "Can you explain this in more detail?" (refers to previous topic)
 
-3) "under_specified"
-   - Too vague or missing key details.
-   - Not clearly tied to history (no pronouns).
-   - Hard to answer without asking for more info.
+3. "under_specified"
+   - Query is incomplete or missing key information.
+   - No clear reference to earlier conversation (no pronouns that link to history).
+   - Too vague to answer accurately as-is.
    - Examples:
-     - "How much does it cost?" (no service specified, no history reference)
-     - "Tell me more" (no topic)
-     - "What are the features?" (no product/service specified).
+     - "How much does it cost?" (no product or service named, no prior context)
+     - "Tell me more." (no topic specified)
+     - "What are the features?" (no service or product specified)
 
 Classification rules:
-- If query uses pronouns (he/she/it/they/that/this) or “this/that one” → **follow_up**.
-- Else if query is complete and specific → **standalone**.
-- Else → **under_specified**.
+- If the query uses pronouns or vague references that clearly rely on previous messages → "follow_up".
+- Else if the query is clear and specific enough to answer directly → "standalone".
+- Else → "under_specified".
 
-Return ONLY one word:
-standalone, follow_up, or under_specified.
-No explanations or extra text.
+Return ONLY one word: standalone, follow_up, or under_specified.
+No explanation, no quotes, no extra text.
 """
 ```
 
 ---
 
-### 2.3 `query_decontextualization_prompt`
+### C. Decontextualization prompt (for follow-ups)
 
 ```python
-query_decontextualization_prompt = """
-You are a query decontextualizer for the Exigotech chatbot.
+query_decontextualization_prompt = f"""
+You are a query decontextualizer for {COMPANY_NAME}'s chatbot.
 
-Your job: rewrite the user’s query so it is STANDALONE and COMPLETE,
-using only the provided conversation history.
+Your task: rewrite the user's query so it becomes a STANDALONE, COMPLETE question
+that can be answered without seeing the previous conversation.
+
+Use:
+- The conversation history (previous user questions and assistant replies).
+- The current user query.
 
 Rules:
-1) Replace pronouns (he/she/it/they/that/this) with the correct person, service, or topic from history.
-2) Add missing context (service names, product names, roles, topics) so the query makes sense alone.
-3) Expand abbreviations and short forms (e.g., MD → Managing Director, CEO → Chief Executive Officer).
-4) Keep the query short, natural, and in the user’s voice.
-5) Preserve the user’s intent exactly. Do NOT add new facts.
+1. Replace pronouns ("he", "she", "it", "they", "this", "that", "these", "those")
+   with the correct person, service, topic, or entity from the history.
+2. Add missing context (service names, product names, roles, topics) if they are clear
+   from previous messages.
+3. Preserve the user's original intent and meaning exactly.
+4. Do NOT add new facts, services, or assumptions that are not in the history.
+5. Keep the rewritten query short and natural, like a normal question.
+6. Do not mention that this is a rewrite or that there was history.
 
-History (user + assistant turns):
-{history}
+History:
+{{history}}
 
-Original user query:
-{query}
+User query:
+{{query}}
 
-Return ONLY the rewritten query text, nothing else.
+Rewrite the query as a single standalone question.
+Return ONLY the rewritten question text, nothing else.
 """
 ```
 
+> 🔧 Note: here I used `{history}` / `{query}` as placeholders – match whatever format your Python code already uses (if it uses `{history_text}` etc., adjust names but keep the rules).
+
 ---
 
-### 2.4 Clarification prompts
-
-#### `clarification_underspecified_prompt`
+### D. Clarification prompts (under-specified vs follow-up with missing context)
 
 ```python
 clarification_underspecified_prompt = """
 The user asked: "{query}"
 
-This query is too vague or incomplete. Generate ONE short, polite
-clarifying question so you can understand what they need.
+This query is too vague or incomplete. Generate ONE polite, specific clarifying
+question to understand what they need.
 
 Examples:
-- Query: "How much does it cost?"
-  Clarification: "Which Exigotech service or product are you asking about for pricing?"
-- Query: "Tell me more"
-  Clarification: "What would you like to know more about? A specific service, solution, or case study?"
-- Query: "What are the features?"
-  Clarification: "Which product or service do you want to know the features of?"
+- "How much does it cost?" → "Which service or product are you asking about?"
+- "Tell me more" → "What would you like to know more about? We offer cloud services, automation, security, AI solutions, and more."
+- "What are the features?" → "Which service or solution would you like to know the features of?"
 
-Now generate a helpful clarifying question for this user.
-Return ONLY the question text.
+Generate only the clarifying question.
 """
-```
 
-#### `clarification_followup_prompt`
-
-```python
 clarification_followup_prompt = """
 The user asked: "{query}"
 
-This looks like a follow-up that depends on earlier conversation,
-but you do NOT have that context available.
-
-Generate ONE short, polite question asking the user to restate
-or specify what they are referring to.
+This looks like a follow-up, but you do NOT have enough context to know what it refers to.
+Generate ONE polite clarifying question asking them to specify the person, service, or topic.
 
 Examples:
-- Query: "How old is he?"
-  Clarification: "Who are you asking about? Please specify the person's name."
-- Query: "What’s the pricing for that?"
-  Clarification: "Which Exigotech service or solution are you asking about for pricing?"
-- Query: "Can you explain this in detail?"
-  Clarification: "Could you specify which topic or service you’d like a detailed explanation for?"
+- "How old is he?" → "Who are you asking about? Please specify the person's name."
+- "What’s the pricing for it?" → "Which service or product are you asking about?"
+- "Can you explain this in detail?" → "Which part would you like me to explain in more detail?"
 
-Return ONLY the clarifying question text.
+Generate only the clarifying question.
 """
 ```
 
+These are short and focused → low token cost, but still give good clarifications.
+
 ---
 
-## 3️⃣ What I recommend you actually do now
+### E. Greeting / conclusion responses (short + strict)
 
-Very concrete steps for you:
+```python
+greeting_response_prompt = f"""
+You are {ASSISTANT_NAME}. Generate a brief, friendly greeting response.
 
-1. **Clean duplicates**
+Structure (do NOT print labels):
+1. Short greeting (1 short sentence).
+2. One short sentence offering help, mentioning {COMPANY_NAME}.
 
-   * Delete `intent_classification_prompt`.
-   * Delete any other prompt definitions that are not referenced anywhere (search in VS Code).
+Constraints:
+- Maximum 2 sentences total.
+- No links, titles, or contact details.
+- No invented facts about {COMPANY_NAME}.
 
-2. **Replace** the existing long blocks for:
+Generate only the greeting text.
+"""
 
-   * `main_intent_classifier`
-   * `query_type_classification_prompt`
-   * `query_decontextualization_prompt`
-   * `clarification_underspecified_prompt`
-   * `clarification_followup_prompt`
-     with the versions above.
+conclusion_response_prompt = f"""
+You are {ASSISTANT_NAME}. Generate a brief, friendly conclusion response.
 
-3. **Don’t touch** your greeting/about/contact/page/case prompts yet.
-   We’ll optimize those after we see real traces and costs.
+Structure (do NOT print labels):
+1. Short goodbye (1 short sentence).
+2. One short sentence saying the user can come back with more questions later.
 
-4. **Later step (after this works):**
+Constraints:
+- Maximum 2 sentences total.
+- No links, titles, or contact details.
+- No invented facts about {COMPANY_NAME}.
 
-   * Introduce `{COMPANY_NAME}` style placeholders (or simple `.format(company_name=...)`) so we can flip from Exigotech → some other company without rewriting prompts.
+Generate only the conclusion text.
+"""
+```
 
-If you paste these in and everything runs, next I can help you:
+Tiny, predictable, and cheap.
 
-* trim the **answer-generation / “relevant services”** prompts in `exigotech_chatbot.py`, and
-* tighten them so they **never** go outside your context (no OpenAI-CEO style answers) while still being short.
+---
 
+## 3️⃣ What to delete *right now*
 
+Once you paste the above:
 
+* You can **delete or comment out** in `prompts.py`:
 
+  * old `intent_classification_prompt`
+  * `trail_query_rewriting_prompt`
+  * `contextualize_query_rewrite_prompt`
+  * `llm_contact_label_prompt`
+  * `greeting_and_conclusion_merged_prompt`
+  * any `*_old_prompt` that is not used in code any more
+
+(If you’re unsure whether something is still used, you can `Ctrl+Shift+F` in VS Code and search for the variable name. If nothing references it → safe to kill.)
+
+---
+
+## 4️⃣ Next step (after you paste this)
+
+Once this is in and your app still runs, we’ll tackle the **big boys**:
+
+* `contact_intent_prompt`
+* `about_intent_prompt`
+* `career_intent_prompt`
+* `page_intent_prompt_improved` (including the **related services JSON** logic)
+* `case_intent_prompt`
+
+There we’ll:
+
+* enforce **one consistent answer structure**
+* ensure the last JSON object is **exactly** `{ "Button label": "Follow-up question", ... }`
+* trim any repeated “essay” instructions so tokens stay low
+
+When you’re done pasting this block and it’s running, just tell me “ready for answer prompts” and we’ll surgically rewrite those next.
