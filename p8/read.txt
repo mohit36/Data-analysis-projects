@@ -1,53 +1,94 @@
-Got it, let’s wire the “YES/NO/AMBIGUOUS” contact brain in properly.
+Nice catch, and thanks for laying out both versions—that makes it super clear what’s clashing.
 
-I’ll give you **two things**:
+Right now you effectively have **two different designs** for `micro_llm.py`:
 
-1. A new `micro_llm.py` file (drop into same package as `chatbot_api.py`).
-2. A **small patch** for `chatbot_api.py` that:
+1. Old one: `confirm/decline/other` (provider-aware, Ollama/OpenAI)
+2. New one: `YES/NO/AMBIGUOUS/UNRELATED` (no provider switching)
 
-   * Detects when the *previous assistant message* was a contact offer.
-   * Calls `classify_contact_reply()` on the user’s current message.
-   * Handles **YES / NO / AMBIGUOUS / UNRELATED** cleanly.
-   * Reuses the same `session_history_snapshot` for RAG.
+You want **one final file** that:
+
+* Works with **Ollama OR OpenAI/Azure**, controlled by `.env`
+* Exposes **`classify_contact_reply(user_text)` → YES/NO/AMBIGUOUS/UNRELATED**
+* And (for safety) still supports `classify_contact_reply_small(...)` if some old code is still calling it
+
+So we’ll merge them.
 
 ---
 
-## 1️⃣ New file: `micro_llm.py`
+## ✅ Step 1 – Replace `micro_llm.py` with a unified, provider-aware version
 
-Create `chatbot_agents/micro_llm.py` (or wherever your API can import it from – just be consistent with the import you use later).
+**File:** `chatbot_agents/micro_llm.py`
+**Action:** Replace the *entire* file content with this:
 
 ```python
-# micro_llm.py
+# chatbot_agents/micro_llm.py
 #
-# Cheap classifier for contact follow-up replies.
-# Labels: "YES", "NO", "AMBIGUOUS", "UNRELATED"
+# Contact reply classifier with provider switching (Ollama / Azure / OpenAI).
+#
+# Main API:
+#   - classify_contact_reply(user_text) -> "YES" | "NO" | "AMBIGUOUS" | "UNRELATED"
+#
+# Compatibility API (if older code still uses it):
+#   - classify_contact_reply_small(offer_text, reply) -> "confirm" | "decline" | "other"
 #
 # Strategy:
-#   1. Fast regex/keyword heuristic for obvious YES/NO/UNRELATED.
-#   2. If result is "AMBIGUOUS" and MICRO_LLM_DEPLOYMENT is set,
-#      call a small LLM (Azure/OpenAI) to refine.
-#
-# This intentionally does NOT do any query rewriting itself.
-# It only returns a label; caller decides what to do.
+#   1. Fast heuristic for obvious YES/NO/UNRELATED.
+#   2. If result is AMBIGUOUS and provider is configured, call a small LLM
+#      via Ollama or Azure/OpenAI (controlled by env).
 
 import os
 import re
+import logging
 from typing import Literal
 
+import httpx
 from dotenv import load_dotenv
 import openai
 
 load_dotenv()
+logger = logging.getLogger(__name__)
 
-# Use a separate deployment if you want (cheaper model),
-# otherwise fall back to your main Azure deployment.
+# -------------------------------------------------------------------
+# Types
+# -------------------------------------------------------------------
+
+ContactLabel = Literal["YES", "NO", "AMBIGUOUS", "UNRELATED"]
+ReplyDecision = Literal["confirm", "decline", "other"]
+
+# -------------------------------------------------------------------
+# Env config
+# -------------------------------------------------------------------
+
+# Which micro LLM provider to use for ambiguous cases:
+#   - "ollama"  -> call local Ollama
+#   - "azure"   -> call Azure OpenAI (engine = MICRO_LLM_DEPLOYMENT)
+#   - "openai"  -> call OpenAI model (model = SMALL_LLM_MODEL)
+#   - anything else / empty -> heuristic only (no LLM)
+SMALL_LLM_PROVIDER = os.getenv("SMALL_LLM_PROVIDER", "ollama").lower()
+
+# Ollama config
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_CONTACT_MODEL = os.getenv("OLLAMA_CONTACT_MODEL", "llama3.2:latest")
+USE_OLLAMA_CONTACT = os.getenv("USE_OLLAMA_CONTACT", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+
+# Azure / OpenAI config for micro LLM
+# For Azure:
+#   - CHAT_PROVIDER=azure
+#   - AZURE_OPENAI_* already set globally (same as exigotech_chatbot.py)
 MICRO_LLM_DEPLOYMENT = os.getenv("MICRO_LLM_DEPLOYMENT") or os.getenv(
     "AZURE_CHAT_DEPLOYMENT"
 )
+SMALL_LLM_MODEL = os.getenv("SMALL_LLM_MODEL", "gpt-4.1-mini")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 
-ContactLabel = Literal["YES", "NO", "AMBIGUOUS", "UNRELATED"]
-
+# -------------------------------------------------------------------
+# Heuristic classifier
+# -------------------------------------------------------------------
 
 def _heuristic_contact_label(text: str) -> ContactLabel:
     """Very cheap classifier for obvious yes/no/unrelated answers."""
@@ -82,9 +123,9 @@ def _heuristic_contact_label(text: str) -> ContactLabel:
         r"^maybe later.*",
         r".*\bno thanks\b.*",
         r".*\bno,? that'?s ok\b.*",
-        r".*\bI'?ll reach out myself\b.*",
-        r".*\bI will contact\b.*",
-        r".*\bI already have their details\b.*",
+        r".*\bi'?ll reach out myself\b.*",
+        r".*\bi will contact\b.*",
+        r".*\bi already have their details\b.*",
     ]
 
     for pat in no_patterns:
@@ -100,34 +141,88 @@ def _heuristic_contact_label(text: str) -> ContactLabel:
     return "AMBIGUOUS"
 
 
-async def _llm_contact_label(text: str) -> ContactLabel:
-    """Optional small LLM refinement when heuristic says AMBIGUOUS."""
-    if not MICRO_LLM_DEPLOYMENT:
+# -------------------------------------------------------------------
+# LLM-based refinement (provider-aware)
+# -------------------------------------------------------------------
+
+async def _call_ollama_contact_label(prompt: str) -> ContactLabel:
+    """Call Ollama /api/chat and interpret its one-word reply."""
+    if not USE_OLLAMA_CONTACT:
         return "AMBIGUOUS"
 
-    prompt = (
-        "You are a classifier for a chatbot contact flow.\n"
-        "The assistant previously asked the user if they want to be connected "
-        "to a sales/contact person. The user replied:\n\n"
-        f'"{text}"\n\n'
-        "Classify the user reply into exactly ONE of these labels:\n"
-        '- YES: user clearly wants to be connected / share contact details.\n'
-        "- NO: user clearly does NOT want contact now.\n"
-        "- AMBIGUOUS: unclear, hedging, or mixed.\n"
-        "- UNRELATED: reply is a new question or unrelated to the contact offer.\n\n"
-        "Reply with ONLY the label word: YES, NO, AMBIGUOUS, or UNRELATED."
-    )
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{OLLAMA_BASE_URL}/api/chat",
+                json={
+                    "model": OLLAMA_CONTACT_MODEL,
+                    "messages": [
+                        {"role": "user", "content": prompt},
+                    ],
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            content = (
+                data.get("message", {})
+                .get("content", "")
+                .strip()
+                .upper()
+            )
+    except Exception as e:
+        logger.warning("Ollama contact classifier failed: %s", e)
+        return "AMBIGUOUS"
 
-    # NOTE: this respects whatever Azure/OpenAI config you've already set
-    # globally (same as exigotech_chatbot.py).
-    resp = await openai.ChatCompletion.acreate(
-        engine=MICRO_LLM_DEPLOYMENT,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-        max_tokens=5,
-    )
+    if "YES" in content:
+        return "YES"
+    if "NO" in content and "YES" not in content:
+        return "NO"
+    if "UNRELATED" in content:
+        return "UNRELATED"
+    if "AMBIGUOUS" in content:
+        return "AMBIGUOUS"
 
-    raw = resp["choices"][0]["message"]["content"].strip().upper()
+    return "AMBIGUOUS"
+
+
+async def _call_openai_contact_label(prompt: str) -> ContactLabel:
+    """
+    Use Azure/OpenAI small model to classify the reply.
+    For Azure, ensure openai.api_type/api_base/api_key are set globally.
+    """
+    if not OPENAI_API_KEY and SMALL_LLM_PROVIDER == "openai":
+        logger.warning(
+            "OPENAI_API_KEY not set for SMALL_LLM_PROVIDER=openai; "
+            "falling back to heuristic only."
+        )
+        return "AMBIGUOUS"
+
+    try:
+        if SMALL_LLM_PROVIDER == "azure":
+            if not MICRO_LLM_DEPLOYMENT:
+                logger.warning(
+                    "MICRO_LLM_DEPLOYMENT not set for SMALL_LLM_PROVIDER=azure."
+                )
+                return "AMBIGUOUS"
+
+            resp = await openai.ChatCompletion.acreate(
+                engine=MICRO_LLM_DEPLOYMENT,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                max_tokens=5,
+            )
+        else:  # "openai"
+            resp = await openai.ChatCompletion.acreate(
+                model=SMALL_LLM_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                max_tokens=5,
+            )
+
+        raw = resp["choices"][0]["message"]["content"].strip().upper()
+    except Exception as e:
+        logger.warning("OpenAI/Azure contact classifier failed: %s", e)
+        return "AMBIGUOUS"
 
     if "YES" in raw:
         return "YES"
@@ -141,11 +236,51 @@ async def _llm_contact_label(text: str) -> ContactLabel:
     return "AMBIGUOUS"
 
 
+async def _llm_contact_label(text: str) -> ContactLabel:
+    """Dispatch to the appropriate provider based on SMALL_LLM_PROVIDER."""
+    if SMALL_LLM_PROVIDER == "ollama":
+        prompt = (
+            "You are a classifier for a chatbot contact flow.\n"
+            "The assistant previously asked the user if they want to be connected "
+            "to a sales/contact person. The user replied:\n\n"
+            f'"{text}"\n\n'
+            "Classify the user reply into exactly ONE of these labels:\n"
+            "- YES: user clearly wants to be connected / share contact details.\n"
+            "- NO: user clearly does NOT want contact now.\n"
+            "- AMBIGUOUS: unclear, hedging, or mixed.\n"
+            "- UNRELATED: reply is a new question or unrelated to the contact offer.\n\n"
+            "Reply with ONLY the label word: YES, NO, AMBIGUOUS, or UNRELATED."
+        )
+        return await _call_ollama_contact_label(prompt)
+
+    if SMALL_LLM_PROVIDER in ("azure", "openai"):
+        prompt = (
+            "You are a classifier for a chatbot contact flow.\n"
+            "The assistant previously asked the user if they want to be connected "
+            "to a sales/contact person. The user replied:\n\n"
+            f'"{text}"\n\n'
+            "Classify the user reply into exactly ONE of these labels:\n"
+            "- YES: user clearly wants to be connected / share contact details.\n"
+            "- NO: user clearly does NOT want contact now.\n"
+            "- AMBIGUOUS: unclear, hedging, or mixed.\n"
+            "- UNRELATED: reply is a new question or unrelated to the contact offer.\n\n"
+            "Reply with ONLY the label word: YES, NO, AMBIGUOUS, or UNRELATED."
+        )
+        return await _call_openai_contact_label(prompt)
+
+    # Unknown provider or disabled => no LLM refinement
+    return "AMBIGUOUS"
+
+
+# -------------------------------------------------------------------
+# Public APIs
+# -------------------------------------------------------------------
+
 async def classify_contact_reply(user_text: str) -> ContactLabel:
     """
-    Public API:
+    Main API:
       - Run fast heuristic first.
-      - Only if AMBIGUOUS, optionally call a tiny LLM.
+      - Only if AMBIGUOUS and provider configured, optionally call a small LLM.
     """
     label = _heuristic_contact_label(user_text)
     if label != "AMBIGUOUS":
@@ -153,480 +288,121 @@ async def classify_contact_reply(user_text: str) -> ContactLabel:
 
     try:
         return await _llm_contact_label(user_text)
-    except Exception:
+    except Exception as e:
+        logger.warning("classify_contact_reply LLM path failed: %s", e)
         # Fail safe: don't break the flow just because LLM failed.
         return "AMBIGUOUS"
+
+
+# Compatibility layer for older "confirm/decline/other" code, if any:
+async def classify_contact_reply_small(
+    offer_text: str,
+    reply: str,
+) -> ReplyDecision:
+    """
+    Map the richer YES/NO/AMBIGUOUS/UNRELATED labels to
+    confirm/decline/other for older call sites, if still used.
+    """
+    label = await classify_contact_reply(reply)
+
+    if label == "YES":
+        return "confirm"
+    if label == "NO":
+        return "decline"
+
+    # For AMBIGUOUS or UNRELATED, treat as 'other'
+    return "other"
 ```
 
-### `.env` knobs for this
+This file now:
 
-Add (or adjust) in `.env`:
+* Supports **Ollama OR Azure OR OpenAI**, chosen via `.env`
+* Exposes **`classify_contact_reply`** (new logic, YES/NO/AMBIGUOUS/UNRELATED)
+* Exposes **`classify_contact_reply_small`** (legacy confirm/decline/other mapping)
+* Uses your existing global OpenAI/Azure config (same as in `exigotech_chatbot.py`)
+
+---
+
+## ✅ Step 2 – How to configure providers in `.env`
+
+You can now switch behavior with **only env changes**, no code edits:
+
+### 🔹 Use **Ollama** (local, free)
 
 ```env
-# Micro LLM for YES/NO/AMBIGUOUS classification
-MICRO_LLM_DEPLOYMENT=gpt-4o-mini      # or a cheaper Azure deployment; or leave empty to use only heuristics
+SMALL_LLM_PROVIDER=ollama
+USE_OLLAMA_CONTACT=true
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_CONTACT_MODEL=llama3.2:latest
 ```
 
-If you leave `MICRO_LLM_DEPLOYMENT` empty, it will **only use the heuristic** (still works).
+No `OPENAI_API_KEY` needed for this.
 
 ---
 
-## 2️⃣ Patch `chatbot_api.py` to use the classifier
+### 🔹 Use **Azure** (cheap small deployment)
 
-You already pasted a big cleaned version; we’ll **only touch three places**.
+```env
+SMALL_LLM_PROVIDER=azure
+MICRO_LLM_DEPLOYMENT=gpt-4o-mini        # or any cheap Azure deployment name
+# AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, etc., already used by your main code
+```
 
-### (a) Add import
+This reuses your global Azure OpenAI config set in `exigotech_chatbot.py`.
 
-At the top, together with your other imports, add:
+---
+
+### 🔹 Use **OpenAI** (direct API, non-Azure)
+
+```env
+SMALL_LLM_PROVIDER=openai
+OPENAI_API_KEY=sk-xxxx
+SMALL_LLM_MODEL=gpt-4.1-mini            # or gpt-4o-mini, etc.
+```
+
+For this case, make sure you *don’t* override `openai.api_type="azure"` globally, or you’ll confuse it. If needed, we can later separate Azure vs OpenAI clients, but for now I’d recommend **Ollama or Azure** as the two main modes.
+
+---
+
+## ✅ Step 3 – Make sure imports match
+
+Given what we did earlier, make sure in `chatbot_api.py` you have:
 
 ```python
-from micro_llm import classify_contact_reply
+from chatbot_agents.micro_llm import classify_contact_reply
 ```
 
-(Use the correct package path; if `micro_llm.py` is under `chatbot_agents`, then do
-`from chatbot_agents.micro_llm import classify_contact_reply`.)
+If you still have any old code that imports `classify_contact_reply_small`, it will still work because we kept that function as a wrapper.
 
 ---
 
-### (b) Add helper to detect “contact offer” messages
+## ✅ Step 4 – Sanity check
 
-Somewhere with your other helpers (e.g., just above `# Endpoints` is fine), add:
+After replacing `micro_llm.py` and checking imports:
 
-```python
-def looks_like_contact_offer(message: str) -> bool:
-    """
-    Heuristic check: was the LAST assistant message offering to connect
-    the user to a sales/contact person?
+1. Restart your backend.
+2. Hit an endpoint that triggers contact offer:
 
-    This is intentionally simple; we rely on consistent phrasing in the
-    contact prompts (e.g., 'Do you want me to connect you...').
-    """
-    if not message:
-        return False
+   * Ask about a service,
+   * Bot offers “Do you want me to connect…”
+   * Reply with:
 
-    m = message.lower()
+     * “yes”
+     * “no thanks”
+     * “maybe later”
+     * “what are your cloud services?”
+3. Watch logs for lines like:
 
-    patterns = [
-        "do you want me to connect",
-        "would you like me to connect",
-        "can i connect you with",
-        "should i connect you with",
-        "do you want me to put you in touch",
-        "would you like to be connected",
-        "do you want me to connect with this person",
-    ]
-
-    return any(p in m for p in patterns)
+```text
+Contact follow-up detected. User reply='yes' -> label=YES
+Contact follow-up detected. User reply='no thanks' -> label=NO
+...
 ```
 
----
+If anything throws an error, paste the traceback and I’ll patch that **without** rewriting the whole file again.
 
-### (c) Update `summarize()` to:
+Once this micro_llm layer is stable, we can go back to:
 
-* Load history earlier.
-* Detect “contact offer” and classify current user reply.
-* Handle YES / NO / AMBIGUOUS / UNRELATED.
-* Reuse the same `session_history_snapshot` later for RAG.
-
-Find your `summarize` function. Inside it, right after this block:
-
-```python
-        # 2) DB-based counters (used for potential business heuristics)
-        msg_count = await get_msg_count(sid)
-        state = get_session_state(sid)
-        business_count = int(state.get("business_count", 0))
-```
-
-**Insert this new block**:
-
-```python
-        # 2b) Load recent history once (used for contact flow + RAG)
-        session_history_snapshot = await get_history_snapshot(sid)
-
-        # 2c) If the last assistant message was a contact offer,
-        #     interpret this user message as a YES/NO/AMBIGUOUS reply.
-        last_assistant_msg = None
-        for m in reversed(session_history_snapshot):
-            if m.get("role") == "assistant":
-                last_assistant_msg = m.get("content") or ""
-                break
-
-        if last_assistant_msg and looks_like_contact_offer(last_assistant_msg):
-            label = await classify_contact_reply(query)
-            logger.info(
-                "Contact follow-up detected. User reply='%s' -> label=%s",
-                query,
-                label,
-                extra={"service": "api"},
-            )
-
-            if label == "YES":
-                # Rewrite into a canonical contact question for RAG.
-                # (RAG will fetch the best contact details / page.)
-                query = "How can I contact Exigotech sales team about this service?"
-            elif label == "NO":
-                # User clearly declined contact: acknowledge and stop.
-                ack = (
-                    "Got it — I won't connect you right now. "
-                    "If you need anything else, just ask another question."
-                )
-                await push_user(sid, query)
-                await push_assistant_sanitized(sid, ack)
-
-                return {
-                    "summary": ack,
-                    "useful_links": [],
-                    "mapped_questions": {},
-                    "needs_clarification": False,
-                }
-            elif label == "UNRELATED":
-                # Treat as a new, unrelated question; continue normally.
-                pass
-            else:  # AMBIGUOUS
-                # Let the normal context engine + clarification handle it.
-                pass
-```
-
-> ⚠️ Important: this block **reuses** `session_history_snapshot`.
-> We’ll now make sure we don’t re-call `get_history_snapshot` later.
-
----
-
-### (d) Reuse `session_history_snapshot` in the RAG step
-
-Later in `summarize` you currently have:
-
-```python
-        # 7) Normal RAG / search flow with context-aware processing
-        session_history_snapshot = await get_history_snapshot(sid)
-
-        processed_query, results, search_metadata = await hybrid_query_search(
-            query=query,
-            history=session_history_snapshot,
-            top_k=10,
-            request_url=str(request.url),
-            country_code=country_code,
-        )
-```
-
-**Change this to remove the second DB call** – just:
-
-```python
-        # 7) Normal RAG / search flow with context-aware processing
-        processed_query, results, search_metadata = await hybrid_query_search(
-            query=query,
-            history=session_history_snapshot,
-            top_k=10,
-            request_url=str(request.url),
-            country_code=country_code,
-        )
-```
-
-That’s it. The rest of the function stays the same.
-
----
-
-## What this gives you now
-
-* If the last assistant turn **offered contact** (“Do you want me to connect…”) and the user’s next message is:
-
-  * “yes”, “sure”, “please do”, “connect me”, etc.
-    → `label == YES` → query rewritten to canonical contact question → goes through full RAG + LLM to find best contact details.
-  * “no”, “no thanks”, “I’ll contact them myself”, etc.
-    → `label == NO` → we send a short acknowledgement and **stop** (no RAG / LLM cost).
-  * A new question like “Actually, what are your cloud services?”
-    → `label == UNRELATED` → pipeline treats it as a brand-new question, full context processing.
-  * Weird / mixed reply (“maybe later but tell me more about pricing”)
-    → heuristic → `AMBIGUOUS` → small LLM classifier tries to decide.
-
-    * If even then unclear, it leaves label as `AMBIGUOUS` → normal pipeline (your existing context + clarification logic decides what to do).
-
-Nothing else in your pipeline changes: **history filtering, decontextualization, dual pgvector search, reranking, buttons JSON, etc. all stay intact.**
-
-If anything crashes or behaves oddly after you paste this, send me:
-
-* The traceback, or
-* The specific snippet around the error
-
-and I’ll patch it without making you re-read the whole file again.
-
-
-
-
-
-
-
-Perfect — now we are entering **full production-flow territory**.
-Let’s design it properly so you never have leaks, loops, or context confusion.
-
-You want **two things**:
-
----
-
-# ✅ 1. When user says YES →
-
-**A. Retrieve the contact information from your RAG pipeline**
-**B. Send it to the user**
-**C. END the session cleanly (no more history influences)**
-
----
-
-# ✅ 2. Give you **all changes step-by-step**, small patches only
-
-(so you can paste safely without rewriting whole files)
-
----
-
-# ⭐ FIRST — HOW WILL WE GET `contact information`?
-
-You already have:
-
-* **pgvector DB** with chunked content
-* LLM prompt that produces structured answer
-* RAG search (hybrid_query_search)
-* LLM generating nicely structured content
-
-BUT you do NOT have direct structured contact information.
-
-So here’s the **correct way**:
-
----
-
-# 🎯 **Plan to get Contact Information Reliably**
-
-When user says “YES”, we will:
-
-### Step A — REWRITE QUERY (canonical)
-
-We already do:
-
-```
-query = "How can I contact Exigotech sales team about this service?"
-```
-
-This triggers your RAG → hybrid_query_search → generate_exigotech_answer →
-which will find pages like:
-
-* `/contact-us`
-* `/services/<service>/sales`
-* `/get-quote`
-* Anything with “Contact”, “Talk to us”, “Pricing”, “Sales inquiry”
-
-AND your LLM prompt **already has this instruction**:
-
-> 3. Tells how to contact Exigotech (if no contact, give generic contact info).
-
-So the LLM will ALWAYS produce a section like:
-
-```
-**Contact:** Exigotech Sales Team  
-Phone: +1-xxx  
-Email: sales@exigotech.com  
-URL: https://www.exigotech.com/contact
-```
-
-→ PERFECT.
-This is all we need.
-
-Meaning:
-**Contact information is extracted NATURALLY by LLM using context from RAG.**
-
----
-
-# ⭐ After sending the contact information, end the session
-
-We will:
-
-### Step 1 — send the contact message
-
-### Step 2 — delete the conversation history from Postgres for this session
-
-### Step 3 — clear mapping_store for this session
-
-### Step 4 — tell frontend `"session_ended": true`
-
-So next user message begins fresh (new session_id).
-
----
-
-# ⭐ Now I will give you the changes in SMALL PATCHES
-
----
-
-# 🔧 PATCH 1 — Add helper to RESET SESSION
-
-Add this anywhere above the endpoints:
-
-```python
-async def reset_session(sid: str):
-    """Clear PGVector history + local mapping store."""
-    try:
-        # Delete history from DB
-        # Your pgvector history table likely has: delete from chat_history where session_id = ...
-        from pgvector_helper.session_memory_pgvector import clear_history
-        await clear_history(sid)
-    except Exception as e:
-        logger.error("Failed to clear history for sid=%s: %s", sid, e)
-
-    # Clear in-memory mapping
-    if sid in service_mapping_store:
-        del service_mapping_store[sid]
-```
-
-You MUST add `clear_history()` in your PGVector helper if not exist:
-
-```
-async def clear_history(session_id: str):
-    async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM chat_history WHERE session_id=$1", session_id)
-```
-
-(very simple)
-
----
-
-# 🔧 PATCH 2 — Modify YES branch in contact handling
-
-Find the block we added:
-
-```
-if label == "YES":
-    query = "How can I contact Exigotech sales team about this service?"
-```
-
-REPLACE IT WITH THIS:
-
-```python
-if label == "YES":
-    # 1) Rewrite into canonical RAG contact question
-    query = "How can I contact Exigotech sales team about this service?"
-
-    # 2) Run the full RAG pipeline here immediately (no need to continue)
-    processed_query, results, search_metadata = await hybrid_query_search(
-        query=query,
-        history=session_history_snapshot,
-        top_k=5,
-        request_url=str(request.url),
-        country_code=country_code,
-    )
-
-    # 3) Generate the contact answer
-    contact_answer = await generate_exigotech_answer(
-        chunks=results[:5],
-        query=processed_query,
-        links=None,
-        intent="contact",
-    )
-
-    # 4) Save to DB
-    await push_user(sid, payload.query)
-    await push_assistant_sanitized(sid, contact_answer)
-
-    # 5) Reset session completely
-    await reset_session(sid)
-
-    # 6) Return and tell frontend “session ended”
-    return {
-        "summary": contact_answer,
-        "useful_links": [],
-        "mapped_questions": {},
-        "needs_clarification": False,
-        "session_ended": True
-    }
-```
-
----
-
-# 🔧 PATCH 3 — Add NO-case already works
-
-(We already wrote a perfect NO block.)
-
-Maybe just add `"session_ended": False`:
-
-```python
-return {
-    "summary": ack,
-    "useful_links": [],
-    "mapped_questions": {},
-    "needs_clarification": False,
-    "session_ended": False,
-}
-```
-
----
-
-# 🔧 PATCH 4 — UNRELATED and AMBIGUOUS stay same
-
-No change needed there.
-
----
-
-# 🔧 PATCH 5 — FRONTEND behavior
-
-When `"session_ended": True`, your frontend should:
-
-* Wipe chat UI
-* Remove stored session cookie
-* Start new blank session
-
-This is the cleanest design.
-
----
-
-# ⭐ Final Flow Visualization (Important)
-
-### 📌 Conversation:
-
-**User:** “Tell me about Azure OpenAI service”
-**Bot:** Gives RAG answer + “Do you want me to connect you with sales?”
-**User:** “Yes please”
-
-### 📌 Pipeline steps:
-
-1. Contact block identifies previous message as contact offer
-2. classify_contact_reply(user="yes please") → YES
-3. Contact branch runs RAG → searches “contact”, “sales”, “team”, “Azure OpenAI sales”, etc.
-4. generate_exigotech_answer returns contact section
-5. Bot returns contact details
-6. reset_session() clears all context
-7. Frontend starts new session
-
-### 📌 Result:
-
-Your bot NEVER confuses future intents.
-
----
-
-# ⭐ Next message from user (NEW session!):
-
-“Actually what are your cloud services?”
-
-→ fresh clean query
-→ no collision with previous contact flow
-
----
-
-# 🎉 THIS IMPLEMENTATION IS **BULLETPROOF**
-
-No hallucinations
-No context bleeding
-No loops
-No misclassified yes/no
-No repeated contact flow
-No infinite mapping store growth
-No RAG misuse
-
----
-
-If you want, I can now also modify:
-**generate_exigotech_answer**
-to:
-
-* Reduce token usage by 40–50%
-* Remove repeated URLs
-* Insert a `"sources": [...]` list (reranked URLs)
-* Make output 100% consistent across prompts
-* Avoid hallucinated contacts
-* Provide a structured JSON block at end (optional)
-
-Just tell me “GO” and I’ll refactor that entire file cleanly.
+* The YES branch doing RAG + contact answer + session reset
+* Verify that the flow actually ends the session after contact
+* Then final clean-up of prompts so they produce EXACT, predictable phrasing for `looks_like_contact_offer`.
