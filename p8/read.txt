@@ -1,161 +1,44 @@
-Here are **three final, production-grade, slimmed-down, token-efficient prompts** — fully aligned with your RAG architecture, your company-only constraint, strict no-outside-knowledge, and UI structure needs.
-
-They are ready to paste directly into **prompts.py**.
-
----
-
-# ✅ **1. HISTORY-AWARE DECONTEXTUALIZER PROMPT**
-
-Use this **only when history is relevant**
-(i.e., history similarity ≥ threshold and `process_query_with_context` decides to use history).
-
-### **Purpose:**
-
-Turn follow-ups like *“yes”, “tell me more”, “what about pricing?”* into a **standalone, explicit query** referencing the correct service/solution/page.
-
----
-
-## **🔹 Prompt: HISTORY_AWARE_DECONTEXTUALIZER**
-
-```text
-You rewrite user queries so they can be answered independently of chat history.
+about_person_intent_prompt = """
+You generate concise, factual information about a PERSON, TEAM MEMBER, or DEPARTMENT using ONLY the provided search results.
 
 ### RULES
-- Use ONLY the information from the provided conversation history and the user's last message.
-- If the last message clearly refers to a prior topic, rewrite it into an explicit standalone question.
-- If the last message starts a new, unrelated topic, return it unchanged.
-- NEVER add information not present in the history.
-- NEVER answer the question; only rewrite it.
-- NEVER hallucinate any service, product, or fact.
-- Keep the rewritten query short and precise.
-
-### INPUT
-- History summary (may contain multiple messages): {HISTORY}
-- User’s latest message: {USER_QUERY}
+- Use ONLY the chunk text and metadata from the top 5 search results.
+- Never add information not present in context.
+- Never guess names, roles, experience, certifications, or contact details.
+- If the query is about a person or role and context contains matching info, summarize it.
+- If no matching person appears in context, return a clean fallback indicating no information available.
+- Keep tone professional, concise, neutral.
+- No marketing fluff. No external knowledge. No hallucination.
 
 ### OUTPUT FORMAT (JSON)
 {
-  "rewritten_query": "string",
-  "reason": "why it was rewritten or why left unchanged"
+  "answer": "10–50 word summary strictly from context, or fallback text.",
+  "key_points": ["Item Name: [inline link]", ...],   // only if found; no descriptions
+  "contact_suggestion": "Connect with {Person Name}?" OR "No contact info found.",
+  "related_services": ["service1", "service2"],      // optional; only if present in context
+  "fallback": "only if no relevant person/team info found"
 }
-```
 
----
+### LOGIC DETAILS
+1. ANSWER
+- Provide a factual 10–50 word summary about the person/team based ONLY on the given chunks.
+- If no such info exists, use:
+  "I don't have information on that person or role in the available context."
 
-# ✅ **2. SIMPLE QUERY REFINER (NO HISTORY)**
+2. KEY POINTS
+- If context includes structured points (features, accomplishments, expertise), list them.
+- Use ONLY:  "Item Name: [link]" format.
+- If none: return an empty list.
 
-Use this when **history is irrelevant**
-(i.e., no history or all similarities < threshold).
+3. CONTACT SUGGESTION
+- If any chunk contains a person name + contact or LinkedIn link → suggest connecting.
+- If not present → "No contact info found."
 
-This is a *cheap, fast, low-token* rewrite to clean user queries.
-
----
-
-## **🔹 Prompt: SIMPLE_QUERY_REFINER**
-
-```text
-Rewrite the user query to be clear, short, and focused.
-
-### RULES
-- Rewrite ONLY for clarity.
-- Preserve original meaning exactly.
-- Do NOT assume context.
-- Do NOT add information.
-- Do NOT be verbose.
-- Do NOT perform decontextualization (no history available).
-- NEVER hallucinate services or products.
-
-### INPUT
-{USER_QUERY}
-
-### OUTPUT FORMAT (JSON)
-{
-  "clean_query": "string"
-}
-```
-
----
-
-# ✅ **3. ABOUT-INTENT PROMPT (MERGED & OPTIMIZED)**
-
-This is your **"About Exigotech"** generator — used when
-`intent == "about"` OR the model must describe the company.
-
-This new prompt:
-
-* enforces *strictly company-only knowledge*
-* outputs a **small structured JSON**
-* works for "About", "Why choose", "Who are you", "What is Exigotech", "What do you do"
-* supports UI (sections, values, etc.)
-* can dynamically use your `.env` company name
-
----
-
-Assume you will populate `{COMPANY_NAME}` from `.env`.
-
----
-
-## **🔹 Prompt: ABOUT_COMPANY**
-
-```text
-You generate an official, factual description of {COMPANY_NAME}, using ONLY the text provided in the company_profile section.
-
-### RULES
-- ABSOLUTELY NO external knowledge.
-- If the user asks something not present in the profile, say so explicitly.
-- Keep the tone professional and concise.
-- Never invent founders, dates, awards, clients, office locations, or technologies.
-- Summaries must come strictly from company_profile.
+4. RELATED SERVICES
+- If context mentions services tied to this person/team (e.g., “Cloud”, “Security”), include 1–3 items.
+- MUST come from context only.
 
 ### INPUT
 User query: {USER_QUERY}
-
-company_profile:
-{COMPANY_PROFILE_TEXT}
-
-### OUTPUT FORMAT (JSON)
-{
-  "about": "short paragraph summarizing the company",
-  "core_values": ["if available, derived ONLY from profile"],
-  "focus_areas": ["services/solutions mentioned in profile"],
-  "message": "fallback clarification if user asked something missing"
-}
-```
-
----
-
-# ✅ **SANITY CHECK: ALL 3 PROMPTS TOGETHER**
-
-### Task Alignment
-
-| Task                                                    | Use Which Prompt?                  | Why                                       |
-| ------------------------------------------------------- | ---------------------------------- | ----------------------------------------- |
-| Follow-up like “yes”, “tell me more”, “what pricing?”   | **History-Aware Decontextualizer** | Converts follow-ups to explicit questions |
-| Clean user’s messy query                                | **Simple Query Refiner**           | Lightweight rewrite, no hallucination     |
-| About company (who are you, why choose, what do you do) | **About Company Prompt**           | UI-ready structured JSON, safe boundaries |
-
----
-
-# 🔥 **Next Step I need from you**
-
-Now tell me:
-
-👉 **Do you want me to generate the remaining prompt family?**
-Such as:
-
-* **Service/solution summarization prompt**
-* **Page → “Core offering + Key points + Subservices” extraction**
-* **Business intent prompt (pricing/demo/license etc.)**
-* **Contact-offer generator prompt**
-* **Fallback “answer only from context” enforcement prompt**
-* **Safety prompt (block outside knowledge)**
-
-Or do you want to **paste your entire prompts.py** here and I rebuild it into a fully optimized ultra-compact version?
-
-Just say:
-
-➡️ *“Rebuild my prompts.py fully”*
-or
-➡️ *“Generate next prompts”*
-
-Your choice.
+Top search results: {CHUNKS}
+"""
