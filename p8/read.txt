@@ -1,408 +1,716 @@
-Nice catch, and thanks for laying out both versions—that makes it super clear what’s clashing.
+Perfect, let’s wire the **session reset** properly first, then we’ll attack `prompts.py`.
 
-Right now you effectively have **two different designs** for `micro_llm.py`:
-
-1. Old one: `confirm/decline/other` (provider-aware, Ollama/OpenAI)
-2. New one: `YES/NO/AMBIGUOUS/UNRELATED` (no provider switching)
-
-You want **one final file** that:
-
-* Works with **Ollama OR OpenAI/Azure**, controlled by `.env`
-* Exposes **`classify_contact_reply(user_text)` → YES/NO/AMBIGUOUS/UNRELATED**
-* And (for safety) still supports `classify_contact_reply_small(...)` if some old code is still calling it
-
-So we’ll merge them.
+I’ll give you **small, surgical patches** you can drop in.
 
 ---
 
-## ✅ Step 1 – Replace `micro_llm.py` with a unified, provider-aware version
+## 1️⃣ Add `clear_session_history` in `session_memory_pgvector.py`
 
-**File:** `chatbot_agents/micro_llm.py`
-**Action:** Replace the *entire* file content with this:
+Open:
+`pgvector_helper/session_memory_pgvector.py`
+
+Right now you already have things like:
 
 ```python
-# chatbot_agents/micro_llm.py
-#
-# Contact reply classifier with provider switching (Ollama / Azure / OpenAI).
-#
-# Main API:
-#   - classify_contact_reply(user_text) -> "YES" | "NO" | "AMBIGUOUS" | "UNRELATED"
-#
-# Compatibility API (if older code still uses it):
-#   - classify_contact_reply_small(offer_text, reply) -> "confirm" | "decline" | "other"
-#
-# Strategy:
-#   1. Fast heuristic for obvious YES/NO/UNRELATED.
-#   2. If result is AMBIGUOUS and provider is configured, call a small LLM
-#      via Ollama or Azure/OpenAI (controlled by env).
+async def save_message(...):
+    ...
 
-import os
-import re
-import logging
-from typing import Literal
+async def get_recent_history(...):
+    ...
 
-import httpx
-from dotenv import load_dotenv
-import openai
+async def get_msg_count(...):
+    ...
+```
 
-load_dotenv()
-logger = logging.getLogger(__name__)
+👉 **Add this new function at the bottom** (and adapt the DB bits to your setup):
 
-# -------------------------------------------------------------------
-# Types
-# -------------------------------------------------------------------
+```python
+# pgvector_helper/session_memory_pgvector.py
 
-ContactLabel = Literal["YES", "NO", "AMBIGUOUS", "UNRELATED"]
-ReplyDecision = Literal["confirm", "decline", "other"]
+async def clear_session_history(session_id: str) -> None:
+    """
+    Delete all stored messages for a given session.
+    Used when a conversation is logically 'ended',
+    e.g., after completing a contact flow or when user resets the chat.
+    """
+    if not session_id:
+        return
 
-# -------------------------------------------------------------------
-# Env config
-# -------------------------------------------------------------------
+    # 🔧 Replace this with your actual DB access logic.
+    # Example if you're using asyncpg directly:
+    #
+    # conn = await get_pg_connection()
+    # async with conn.transaction():
+    #     await conn.execute("DELETE FROM chat_history WHERE session_id = $1", session_id)
+    #
+    # Or if you have a helper/Repository, call that instead.
 
-# Which micro LLM provider to use for ambiguous cases:
-#   - "ollama"  -> call local Ollama
-#   - "azure"   -> call Azure OpenAI (engine = MICRO_LLM_DEPLOYMENT)
-#   - "openai"  -> call OpenAI model (model = SMALL_LLM_MODEL)
-#   - anything else / empty -> heuristic only (no LLM)
-SMALL_LLM_PROVIDER = os.getenv("SMALL_LLM_PROVIDER", "ollama").lower()
+    try:
+        from pgvector_helper.db_connection import get_pg_connection  # if you have something like this
 
-# Ollama config
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_CONTACT_MODEL = os.getenv("OLLAMA_CONTACT_MODEL", "llama3.2:latest")
-USE_OLLAMA_CONTACT = os.getenv("USE_OLLAMA_CONTACT", "true").lower() in {
-    "1",
-    "true",
-    "yes",
-}
+        conn = await get_pg_connection()
+        async with conn.transaction():
+            await conn.execute(
+                "DELETE FROM chat_history WHERE session_id = $1",
+                session_id,
+            )
+    except Exception as e:
+        # Don't let this crash the API – log and move on
+        import logging
 
-# Azure / OpenAI config for micro LLM
-# For Azure:
-#   - CHAT_PROVIDER=azure
-#   - AZURE_OPENAI_* already set globally (same as exigotech_chatbot.py)
-MICRO_LLM_DEPLOYMENT = os.getenv("MICRO_LLM_DEPLOYMENT") or os.getenv(
-    "AZURE_CHAT_DEPLOYMENT"
+        logging.getLogger(__name__).warning(
+            "Failed to clear session history for %s: %s", session_id, e
+        )
+```
+
+⚠️ **Important:**
+You *must* replace the `get_pg_connection` / SQL with whatever you already use to talk to Postgres. The shape is just an example.
+
+---
+
+## 2️⃣ Add `reset_session_state` helper in `chatbot_api.py`
+
+In `chatbot_api.py`, you already import:
+
+```python
+from pgvector_helper.session_memory_pgvector import (
+    save_message,
+    get_recent_history,
+    get_msg_count,
 )
-SMALL_LLM_MODEL = os.getenv("SMALL_LLM_MODEL", "gpt-4.1-mini")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-
-# -------------------------------------------------------------------
-# Heuristic classifier
-# -------------------------------------------------------------------
-
-def _heuristic_contact_label(text: str) -> ContactLabel:
-    """Very cheap classifier for obvious yes/no/unrelated answers."""
-    if not text:
-        return "AMBIGUOUS"
-
-    t = text.strip().lower()
-
-    # Pure yes-ish
-    yes_patterns = [
-        r"^y(es)?[!.]*$",
-        r"^yeah[!.]*$",
-        r"^yep[!.]*$",
-        r"^sure[!.]*$",
-        r"^ok(ay)?[!.]*$",
-        r"^please do.*",
-        r".*\bgo ahead\b.*",
-        r".*\bconnect (me|us)\b.*",
-        r".*\bput me in touch\b.*",
-        r".*\bthat would be great\b.*",
-    ]
-
-    for pat in yes_patterns:
-        if re.search(pat, t):
-            return "YES"
-
-    # Pure no-ish
-    no_patterns = [
-        r"^n(o|ope)[!.]*$",
-        r"^nah[!.]*$",
-        r"^not now.*",
-        r"^maybe later.*",
-        r".*\bno thanks\b.*",
-        r".*\bno,? that'?s ok\b.*",
-        r".*\bi'?ll reach out myself\b.*",
-        r".*\bi will contact\b.*",
-        r".*\bi already have their details\b.*",
-    ]
-
-    for pat in no_patterns:
-        if re.search(pat, t):
-            return "NO"
-
-    # Very clearly a *new* question, not a yes/no
-    question_words = ["what", "how", "where", "when", "who", "which", "why"]
-    if "?" in t or any(t.startswith(w + " ") for w in question_words):
-        return "UNRELATED"
-
-    # Default: needs LLM help
-    return "AMBIGUOUS"
-
-
-# -------------------------------------------------------------------
-# LLM-based refinement (provider-aware)
-# -------------------------------------------------------------------
-
-async def _call_ollama_contact_label(prompt: str) -> ContactLabel:
-    """Call Ollama /api/chat and interpret its one-word reply."""
-    if not USE_OLLAMA_CONTACT:
-        return "AMBIGUOUS"
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                f"{OLLAMA_BASE_URL}/api/chat",
-                json={
-                    "model": OLLAMA_CONTACT_MODEL,
-                    "messages": [
-                        {"role": "user", "content": prompt},
-                    ],
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            content = (
-                data.get("message", {})
-                .get("content", "")
-                .strip()
-                .upper()
-            )
-    except Exception as e:
-        logger.warning("Ollama contact classifier failed: %s", e)
-        return "AMBIGUOUS"
-
-    if "YES" in content:
-        return "YES"
-    if "NO" in content and "YES" not in content:
-        return "NO"
-    if "UNRELATED" in content:
-        return "UNRELATED"
-    if "AMBIGUOUS" in content:
-        return "AMBIGUOUS"
-
-    return "AMBIGUOUS"
-
-
-async def _call_openai_contact_label(prompt: str) -> ContactLabel:
-    """
-    Use Azure/OpenAI small model to classify the reply.
-    For Azure, ensure openai.api_type/api_base/api_key are set globally.
-    """
-    if not OPENAI_API_KEY and SMALL_LLM_PROVIDER == "openai":
-        logger.warning(
-            "OPENAI_API_KEY not set for SMALL_LLM_PROVIDER=openai; "
-            "falling back to heuristic only."
-        )
-        return "AMBIGUOUS"
-
-    try:
-        if SMALL_LLM_PROVIDER == "azure":
-            if not MICRO_LLM_DEPLOYMENT:
-                logger.warning(
-                    "MICRO_LLM_DEPLOYMENT not set for SMALL_LLM_PROVIDER=azure."
-                )
-                return "AMBIGUOUS"
-
-            resp = await openai.ChatCompletion.acreate(
-                engine=MICRO_LLM_DEPLOYMENT,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0,
-                max_tokens=5,
-            )
-        else:  # "openai"
-            resp = await openai.ChatCompletion.acreate(
-                model=SMALL_LLM_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0,
-                max_tokens=5,
-            )
-
-        raw = resp["choices"][0]["message"]["content"].strip().upper()
-    except Exception as e:
-        logger.warning("OpenAI/Azure contact classifier failed: %s", e)
-        return "AMBIGUOUS"
-
-    if "YES" in raw:
-        return "YES"
-    if "NO" in raw and "YES" not in raw:
-        return "NO"
-    if "UNRELATED" in raw:
-        return "UNRELATED"
-    if "AMBIGUOUS" in raw:
-        return "AMBIGUOUS"
-
-    return "AMBIGUOUS"
-
-
-async def _llm_contact_label(text: str) -> ContactLabel:
-    """Dispatch to the appropriate provider based on SMALL_LLM_PROVIDER."""
-    if SMALL_LLM_PROVIDER == "ollama":
-        prompt = (
-            "You are a classifier for a chatbot contact flow.\n"
-            "The assistant previously asked the user if they want to be connected "
-            "to a sales/contact person. The user replied:\n\n"
-            f'"{text}"\n\n'
-            "Classify the user reply into exactly ONE of these labels:\n"
-            "- YES: user clearly wants to be connected / share contact details.\n"
-            "- NO: user clearly does NOT want contact now.\n"
-            "- AMBIGUOUS: unclear, hedging, or mixed.\n"
-            "- UNRELATED: reply is a new question or unrelated to the contact offer.\n\n"
-            "Reply with ONLY the label word: YES, NO, AMBIGUOUS, or UNRELATED."
-        )
-        return await _call_ollama_contact_label(prompt)
-
-    if SMALL_LLM_PROVIDER in ("azure", "openai"):
-        prompt = (
-            "You are a classifier for a chatbot contact flow.\n"
-            "The assistant previously asked the user if they want to be connected "
-            "to a sales/contact person. The user replied:\n\n"
-            f'"{text}"\n\n'
-            "Classify the user reply into exactly ONE of these labels:\n"
-            "- YES: user clearly wants to be connected / share contact details.\n"
-            "- NO: user clearly does NOT want contact now.\n"
-            "- AMBIGUOUS: unclear, hedging, or mixed.\n"
-            "- UNRELATED: reply is a new question or unrelated to the contact offer.\n\n"
-            "Reply with ONLY the label word: YES, NO, AMBIGUOUS, or UNRELATED."
-        )
-        return await _call_openai_contact_label(prompt)
-
-    # Unknown provider or disabled => no LLM refinement
-    return "AMBIGUOUS"
-
-
-# -------------------------------------------------------------------
-# Public APIs
-# -------------------------------------------------------------------
-
-async def classify_contact_reply(user_text: str) -> ContactLabel:
-    """
-    Main API:
-      - Run fast heuristic first.
-      - Only if AMBIGUOUS and provider configured, optionally call a small LLM.
-    """
-    label = _heuristic_contact_label(user_text)
-    if label != "AMBIGUOUS":
-        return label
-
-    try:
-        return await _llm_contact_label(user_text)
-    except Exception as e:
-        logger.warning("classify_contact_reply LLM path failed: %s", e)
-        # Fail safe: don't break the flow just because LLM failed.
-        return "AMBIGUOUS"
-
-
-# Compatibility layer for older "confirm/decline/other" code, if any:
-async def classify_contact_reply_small(
-    offer_text: str,
-    reply: str,
-) -> ReplyDecision:
-    """
-    Map the richer YES/NO/AMBIGUOUS/UNRELATED labels to
-    confirm/decline/other for older call sites, if still used.
-    """
-    label = await classify_contact_reply(reply)
-
-    if label == "YES":
-        return "confirm"
-    if label == "NO":
-        return "decline"
-
-    # For AMBIGUOUS or UNRELATED, treat as 'other'
-    return "other"
 ```
 
-This file now:
-
-* Supports **Ollama OR Azure OR OpenAI**, chosen via `.env`
-* Exposes **`classify_contact_reply`** (new logic, YES/NO/AMBIGUOUS/UNRELATED)
-* Exposes **`classify_contact_reply_small`** (legacy confirm/decline/other mapping)
-* Uses your existing global OpenAI/Azure config (same as in `exigotech_chatbot.py`)
-
----
-
-## ✅ Step 2 – How to configure providers in `.env`
-
-You can now switch behavior with **only env changes**, no code edits:
-
-### 🔹 Use **Ollama** (local, free)
-
-```env
-SMALL_LLM_PROVIDER=ollama
-USE_OLLAMA_CONTACT=true
-OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_CONTACT_MODEL=llama3.2:latest
-```
-
-No `OPENAI_API_KEY` needed for this.
-
----
-
-### 🔹 Use **Azure** (cheap small deployment)
-
-```env
-SMALL_LLM_PROVIDER=azure
-MICRO_LLM_DEPLOYMENT=gpt-4o-mini        # or any cheap Azure deployment name
-# AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, etc., already used by your main code
-```
-
-This reuses your global Azure OpenAI config set in `exigotech_chatbot.py`.
-
----
-
-### 🔹 Use **OpenAI** (direct API, non-Azure)
-
-```env
-SMALL_LLM_PROVIDER=openai
-OPENAI_API_KEY=sk-xxxx
-SMALL_LLM_MODEL=gpt-4.1-mini            # or gpt-4o-mini, etc.
-```
-
-For this case, make sure you *don’t* override `openai.api_type="azure"` globally, or you’ll confuse it. If needed, we can later separate Azure vs OpenAI clients, but for now I’d recommend **Ollama or Azure** as the two main modes.
-
----
-
-## ✅ Step 3 – Make sure imports match
-
-Given what we did earlier, make sure in `chatbot_api.py` you have:
+👉 Change this import to also include the new function:
 
 ```python
-from chatbot_agents.micro_llm import classify_contact_reply
+from pgvector_helper.session_memory_pgvector import (
+    save_message,
+    get_recent_history,
+    get_msg_count,
+    clear_session_history,  # <--- add this
+)
 ```
 
-If you still have any old code that imports `classify_contact_reply_small`, it will still work because we kept that function as a wrapper.
+Then, somewhere near your other helpers (after `service_mapping_store` + `get_session_state` is a good spot), add:
+
+```python
+async def reset_session_state(sid: str) -> None:
+    """
+    Hard reset for a session:
+    - Clear DB-backed history (Postgres)
+    - Clear in-memory mapping of buttons / related services
+    """
+    if not sid:
+        return
+
+    # Clear per-session mapping for related-services / buttons
+    service_mapping_store.pop(sid, None)
+
+    # Clear DB history so future queries start "fresh"
+    await clear_session_history(sid)
+```
+
+Now you have a clean “kill switch” for a conversation.
 
 ---
 
-## ✅ Step 4 – Sanity check
+## 3️⃣ Call it in the **contact YES branch**
 
-After replacing `micro_llm.py` and checking imports:
+You already have the contact follow-up flow wired roughly like:
 
-1. Restart your backend.
-2. Hit an endpoint that triggers contact offer:
+* Detect if last assistant message was a contact offer
+* Classify user reply with `classify_contact_reply` / `llm_contact_reply_classifier`
+* If label == `"YES"` → build contact query, run RAG, call `generate_exigotech_answer(intent="contact")`, return contact info.
 
-   * Ask about a service,
-   * Bot offers “Do you want me to connect…”
-   * Reply with:
+Inside that **YES branch**, after you’ve generated the contact answer and before you `return`, call `reset_session_state(sid)` and expose that to the frontend.
 
-     * “yes”
-     * “no thanks”
-     * “maybe later”
-     * “what are your cloud services?”
-3. Watch logs for lines like:
+Here’s a generic pattern you can adapt into your existing YES branch:
 
-```text
-Contact follow-up detected. User reply='yes' -> label=YES
-Contact follow-up detected. User reply='no thanks' -> label=NO
-...
+```python
+if label == "YES":
+    # 1) Prefer explicit service name if available
+    service_name = state.get("last_service_name")
+    if service_name:
+        query = f"How can I contact {os.getenv('COMPANY_NAME', 'Exigotech')} sales team about {service_name}?"
+    else:
+        query = f"How can I contact {os.getenv('COMPANY_NAME', 'Exigotech')} sales team about this service?"
+
+    # 2) Run RAG contact search
+    session_history_snapshot = await get_history_snapshot(sid)
+    processed_query, results, search_metadata = await hybrid_query_search(
+        query=query,
+        history=session_history_snapshot,
+        top_k=5,
+        request_url=str(request.url),
+        country_code=country_code,
+    )
+
+    contact_answer = await generate_exigotech_answer(
+        chunks=results[:5],
+        query=processed_query,
+        links=None,
+        intent="contact",
+    )
+
+    # 3) Persist final contact answer for this conversation segment
+    await push_user(sid, payload.query)
+    await push_assistant_sanitized(sid, contact_answer)
+
+    # 4) Extract useful links if you want
+    result_urls = _extract_result_urls(results)
+    useful_links = list(result_urls)[:5]
+
+    # 5) 🔥 HARD RESET SESSION CONTEXT (but keep chat visible in UI)
+    await reset_session_state(sid)
+
+    # 6) Let frontend know this conversation is "closed"
+    return {
+        "summary": contact_answer,
+        "useful_links": useful_links,
+        "mapped_questions": {},   # no more buttons after hard contact
+        "needs_clarification": False,
+        "session_reset": True,    # <--- frontend can use this
+    }
 ```
 
-If anything throws an error, paste the traceback and I’ll patch that **without** rewriting the whole file again.
+You don’t have to copy this whole block if your YES branch is already there – just:
 
-Once this micro_llm layer is stable, we can go back to:
+* Make sure `await reset_session_state(sid)` is called near the end.
+* Add `"session_reset": True` to the returned JSON shape for that path.
 
-* The YES branch doing RAG + contact answer + session reset
-* Verify that the flow actually ends the session after contact
-* Then final clean-up of prompts so they produce EXACT, predictable phrasing for `looks_like_contact_offer`.
+The key idea:
+
+* History + mappings get cleared in backend,
+* The user **still sees the entire conversation in UI**,
+* Next user message is logically a *brand new* topic.
+
+---
+
+## 4️⃣ What your frontend should do with `session_reset`
+
+Once this is in place, your API will sometimes return:
+
+```json
+{
+  "summary": "...",
+  "useful_links": [...],
+  "mapped_questions": {},
+  "needs_clarification": false,
+  "session_reset": true
+}
+```
+
+Your UI can then:
+
+* Show a small system message like:
+
+  > “✅ This conversation has been completed. You can start a new topic now.”
+* Maybe visually separate with a divider or “New conversation” chip.
+* But **do not wipe** the old bubbles — just treat future queries as fresh (backend already does that).
+
+You get **ChatBot.com behavior**:
+– old chat visible,
+– new topic = fresh mental state.
+
+---
+
+Once you’ve wired this and it compiles, we’ll jump to the fun part next:
+**cleaning and optimizing `prompts.py` for speed, cost, and strict Exigotech-only knowledge.**
+
+When you’re ready, paste your current `prompts.py` (or the main prompt definitions), and I’ll start cutting, tightening, and adding the env-driven `{COMPANY_NAME}` pattern you asked for.
+
+
+
+Perfect — I see the **exact code block** you pasted from my instructions, and yes, there is **ONE CRITICAL FIX** you must apply immediately:
+
+---
+
+# ✅ **Your bug: `reset_session(sid)` does NOT exist**
+
+You must rename it to the actual function name we created:
+
+### ✔ Correct function name:
+
+```python
+await reset_session_state(sid)
+```
+
+You currently have:
+
+```python
+await reset_session(sid)
+```
+
+This will raise:
+
+```
+NameError: reset_session is not defined
+```
+
+So update **only that line**:
+
+---
+
+# ✅ **Patch (drop-in fix)**
+
+Find this block:
+
+```python
+# 5) Reset session completely
+await reset_session(sid)
+```
+
+Replace with:
+
+```python
+# 5) Reset session completely
+await reset_session_state(sid)
+```
+
+---
+
+# 🔍 **Double-check: Did you import it correctly?**
+
+At the top of `chatbot_api.py`, you must have:
+
+```python
+from pgvector_helper.session_memory_pgvector import (
+    save_message,
+    get_recent_history,
+    get_msg_count,
+    clear_session_history,
+)
+```
+
+And also:
+
+```python
+async def reset_session_state(sid: str) -> None:
+    ...
+```
+
+If all that is in place, this branch will now work perfectly.
+
+---
+
+# 🧠 **Why this matters**
+
+Without this fix:
+
+* YES → contact flow works
+* but backend crashes at reset step
+* frontend gets no JSON
+* chat appears frozen or dies
+
+After the fix:
+
+* The contact flow completes
+* History is cleared
+* UI shows previous chat
+* New message = new session context
+
+Exactly like ChatBot.com.
+
+---
+
+# 📌 Quick checklist before we move to `prompts.py`
+
+### Must be true before next step:
+
+| Item                                               | Status              |
+| -------------------------------------------------- | ------------------- |
+| `reset_session_state` exists                       | ✅                   |
+| `clear_session_history` implemented in PG helper   | ✅                   |
+| Correct import in chatbot_api                      | ⚠ verify            |
+| Contact YES branch uses `reset_session_state(sid)` | ⬅ apply the fix     |
+| JSON returns `session_reset` or `session_ended`    | You already do this |
+
+---
+
+# 🚀 After this fix, you can send me `prompts.py`
+
+And then:
+
+* I will optimize each prompt
+* Remove redundant instructions
+* Make everything env-driven (`COMPANY_NAME`)
+* Reduce token cost
+* Improve consistency
+* Add safe fallbacks
+* Add caching strategies (per prompt)
+* Ensure fast models can handle lightweight prompts
+
+Your bot will become **fast like ChatBot.com but far more accurate**.
+
+---
+
+💬 **Send `prompts.py` now and I’ll refactor it.**
+
+
+
+
+
+
+
+Good, this is *exactly* the stage where cleaning up pays off in speed and cost. Let’s be ruthless but sensible, not just delete things randomly.
+
+I’ll break it into two parts:
+
+1. **What to keep / delete / merge in `prompt_list.py` right now**
+2. **Concrete short versions for the heavy prompts (patches you can paste)**
+
+---
+
+## 1️⃣ What to keep vs delete / merge
+
+From your screenshots I can see these major prompt blocks in `prompt_list.py`:
+
+### A. Intent classification
+
+You currently have **two** intent classifiers:
+
+1. `intent_classification_prompt`
+2. `main_intent_classifier`
+   (with the comment `#currently using this one`)
+
+**Decision:**
+
+* ✅ **KEEP:** `main_intent_classifier`
+* ❌ **DELETE:** `intent_classification_prompt`
+
+They do the same job with slightly different wording. Two separate big prompts = more confusion and wasted tokens. Your code should only ever call **one** classifier.
+
+Action for you:
+
+* In the whole repo, search for `intent_classification_prompt`.
+
+  * If nothing uses it → delete that whole block from `prompt_list.py`.
+  * If something still uses it → change that usage to `main_intent_classifier`, then delete the old one.
+
+---
+
+### B. Query type classification
+
+* `query_type_classification_prompt`
+  (classifies into `standalone`, `follow_up`, `under_specified`)
+
+**Decision:**
+
+* ✅ **KEEP, but shorten** – this one is important for your “under-specified → clarification” logic.
+* We will trim the text and keep only:
+
+  * 1–2 bullet rules for each type
+  * 2–3 short examples
+  * a strict “return ONLY this label” instruction.
+
+Patch is below in section 2.
+
+---
+
+### C. Decontextualization
+
+* `query_decontextualization_prompt`
+  (rewrites using history, expands abbreviations, etc.)
+
+**Decision:**
+
+* ✅ **KEEP, but shorten.**
+  The *behaviour* is correct for your architecture:
+
+  * use history only when needed;
+  * expand abbreviations (MD → Managing Director, etc.);
+  * keep query standalone.
+
+We’ll compress wording + examples to reduce tokens but not logic.
+
+---
+
+### D. Clarification prompts
+
+You have:
+
+* `clarification_underspecified_prompt`
+* `clarification_followup_prompt`
+
+**Decision:**
+
+* ✅ **KEEP both, but simplify.**
+  They map nicely to your “query_type = under_specified” and “query_type = follow_up but missing context” paths.
+
+What we do:
+
+* Keep *one* clear example block per prompt.
+* Shorten instructions + remove redundant sentences.
+
+---
+
+### E. Greeting / conclusion / page / case / contact / about / career prompts
+
+From earlier:
+
+* `greeting_response_prompt`
+* `conclusion_response_prompt`
+* `contact_intent_prompt`
+* `about_intent_prompt`
+* `career_intent_prompt`
+* `page_intent_prompt` / `page_intent_prompt_improved`
+* `case_intent_prompt`
+
+**Decision:**
+
+* ✅ **KEEP only the versions you actually call from `exigotech_chatbot.py`.**
+* ❌ **Delete older duplicates.**
+
+Concretely:
+
+1. Open `exigotech_chatbot.py`.
+
+2. At top you import:
+
+   ```python
+   from prompt_list import (
+       greeting_response_prompt,
+       conclusion_response_prompt,
+       contact_intent_prompt,
+       about_intent_prompt,
+       career_intent_prompt,
+       page_intent_prompt,
+       case_intent_prompt,
+       page_intent_prompt_improved,
+   )
+   ```
+
+3. Inside `run_exigotech_prompt`, you currently pick the prompt based on `intent`.
+   **Keep only those prompt variables that are imported + used in that function.**
+
+4. Anything in `prompt_list.py` that isn’t:
+
+   * imported anywhere, **and**
+   * not referenced in any `.py` file
+     → safe to delete.
+
+So: run “Find in Files” in VS Code for each prompt name. If count = 1 (definition only), delete it.
+
+---
+
+## 2️⃣ Shorter, cheaper versions of the heavy prompts
+
+Here are replacement blocks you can paste directly into `prompt_list.py`
+(overwrite the existing ones).
+
+### 2.1 `main_intent_classifier` (single intent classifier)
+
+```python
+main_intent_classifier = """
+You are a query intent classifier for the Exigotech chatbot.
+
+Classify the user query into EXACTLY ONE of these intents:
+- greeting
+- conclusion
+- contact        (pricing, quotes, licenses, renewals, purchases, support/help, how to reach company or sales)
+- about          (people, roles, leadership, org structure, careers at company)
+- career         (jobs, hiring, recruitment, positions)
+- page           (services, capabilities, topics, blogs, articles, general info about offerings)
+- case           (case studies, success stories, testimonials)
+
+Rules (short):
+
+1) greeting
+   - Only if it’s JUST a greeting (“hi”, “hello”, “hey”).
+   - If greeting + question → classify by the question, NOT greeting.
+
+2) conclusion
+   - Only if clearly ending the chat (“bye”, “thank you, bye”, “that’s all, thanks”).
+
+3) contact
+   - Only when user asks about contact information, sales team, support team, pricing, cost, quote, demo, renewal, or “talk to a person”.
+   - Example: “How do I contact sales?”, “What does Exigotech charge for cloud security?”, “I want a demo”.
+
+4) about
+   - Questions about people or org: CEO, leadership, team, roles, departments, company background.
+   - Example: “Who is in sales team?”, “Who is the CEO?”, “Tell me about the leadership team”.
+
+5) career
+   - Jobs, openings, applying, hiring, recruitment.
+   - Example: “Any software engineer jobs?”, “How can I apply?”.
+
+6) page
+   - General info about services/solutions, topics, offerings, blogs, articles.
+   - Example: “What services does Exigotech provide?”, “Show me your AI services”.
+
+7) case
+   - Case studies, success stories, client stories, testimonials.
+   - Example: “Show me cloud security success stories”.
+
+Disambiguation:
+- If query is about prices/support/contact → contact.
+- If query is about people / roles / org → about.
+- If query is about services or solutions, not price/support → page.
+
+Return ONLY one word:
+greeting, conclusion, contact, about, career, page, or case.
+No quotes or extra text.
+"""
+```
+
+Delete the old `intent_classification_prompt` block entirely.
+
+---
+
+### 2.2 `query_type_classification_prompt`
+
+```python
+query_type_classification_prompt = """
+You are a query type analyzer for the Exigotech chatbot.
+
+Classify the user query into EXACTLY ONE type:
+
+1) "standalone"
+   - Complete on its own, with clear subject.
+   - Does NOT depend on previous conversation.
+   - Examples:
+     - "Who is the CEO of Exigotech?"
+     - "What cloud services does Exigotech offer?"
+     - "Show me case studies about AI solutions."
+
+2) "follow_up"
+   - Refers to previous conversation using pronouns or vague references.
+   - Needs recent history to understand.
+   - Examples:
+     - "How old is he?" (after asking about a person)
+     - "What’s the pricing for it?" (after a service was mentioned)
+     - "Can you explain this in detail?" (refers to previous topic).
+
+3) "under_specified"
+   - Too vague or missing key details.
+   - Not clearly tied to history (no pronouns).
+   - Hard to answer without asking for more info.
+   - Examples:
+     - "How much does it cost?" (no service specified, no history reference)
+     - "Tell me more" (no topic)
+     - "What are the features?" (no product/service specified).
+
+Classification rules:
+- If query uses pronouns (he/she/it/they/that/this) or “this/that one” → **follow_up**.
+- Else if query is complete and specific → **standalone**.
+- Else → **under_specified**.
+
+Return ONLY one word:
+standalone, follow_up, or under_specified.
+No explanations or extra text.
+"""
+```
+
+---
+
+### 2.3 `query_decontextualization_prompt`
+
+```python
+query_decontextualization_prompt = """
+You are a query decontextualizer for the Exigotech chatbot.
+
+Your job: rewrite the user’s query so it is STANDALONE and COMPLETE,
+using only the provided conversation history.
+
+Rules:
+1) Replace pronouns (he/she/it/they/that/this) with the correct person, service, or topic from history.
+2) Add missing context (service names, product names, roles, topics) so the query makes sense alone.
+3) Expand abbreviations and short forms (e.g., MD → Managing Director, CEO → Chief Executive Officer).
+4) Keep the query short, natural, and in the user’s voice.
+5) Preserve the user’s intent exactly. Do NOT add new facts.
+
+History (user + assistant turns):
+{history}
+
+Original user query:
+{query}
+
+Return ONLY the rewritten query text, nothing else.
+"""
+```
+
+---
+
+### 2.4 Clarification prompts
+
+#### `clarification_underspecified_prompt`
+
+```python
+clarification_underspecified_prompt = """
+The user asked: "{query}"
+
+This query is too vague or incomplete. Generate ONE short, polite
+clarifying question so you can understand what they need.
+
+Examples:
+- Query: "How much does it cost?"
+  Clarification: "Which Exigotech service or product are you asking about for pricing?"
+- Query: "Tell me more"
+  Clarification: "What would you like to know more about? A specific service, solution, or case study?"
+- Query: "What are the features?"
+  Clarification: "Which product or service do you want to know the features of?"
+
+Now generate a helpful clarifying question for this user.
+Return ONLY the question text.
+"""
+```
+
+#### `clarification_followup_prompt`
+
+```python
+clarification_followup_prompt = """
+The user asked: "{query}"
+
+This looks like a follow-up that depends on earlier conversation,
+but you do NOT have that context available.
+
+Generate ONE short, polite question asking the user to restate
+or specify what they are referring to.
+
+Examples:
+- Query: "How old is he?"
+  Clarification: "Who are you asking about? Please specify the person's name."
+- Query: "What’s the pricing for that?"
+  Clarification: "Which Exigotech service or solution are you asking about for pricing?"
+- Query: "Can you explain this in detail?"
+  Clarification: "Could you specify which topic or service you’d like a detailed explanation for?"
+
+Return ONLY the clarifying question text.
+"""
+```
+
+---
+
+## 3️⃣ What I recommend you actually do now
+
+Very concrete steps for you:
+
+1. **Clean duplicates**
+
+   * Delete `intent_classification_prompt`.
+   * Delete any other prompt definitions that are not referenced anywhere (search in VS Code).
+
+2. **Replace** the existing long blocks for:
+
+   * `main_intent_classifier`
+   * `query_type_classification_prompt`
+   * `query_decontextualization_prompt`
+   * `clarification_underspecified_prompt`
+   * `clarification_followup_prompt`
+     with the versions above.
+
+3. **Don’t touch** your greeting/about/contact/page/case prompts yet.
+   We’ll optimize those after we see real traces and costs.
+
+4. **Later step (after this works):**
+
+   * Introduce `{COMPANY_NAME}` style placeholders (or simple `.format(company_name=...)`) so we can flip from Exigotech → some other company without rewriting prompts.
+
+If you paste these in and everything runs, next I can help you:
+
+* trim the **answer-generation / “relevant services”** prompts in `exigotech_chatbot.py`, and
+* tighten them so they **never** go outside your context (no OpenAI-CEO style answers) while still being short.
+
+
+
+
