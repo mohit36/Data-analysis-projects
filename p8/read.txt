@@ -1,335 +1,323 @@
-Good, this is the right moment to wire all the new prompts into the actual flow.
+Nice catch, this is exactly the kind of “where does this logic *actually* bite?” question you should be asking.
 
-I’ll map **exactly which prompt is used where**, and show the key code blocks you need to adjust. I’ll keep it patch-style so you can drop it into the existing files.
+Short answer:
 
----
+* The **query-type classification (standalone / follow_up / under_specified)** should run **before vector search**, not after.
+* The **generic-services override** I suggested is *specifically* for **page-intent** questions (services / offerings).
+* The *pattern* can be reused for other intents (about, career, etc.), but you don’t want one giant rule that fires for everything.
 
-## 1. Imports in `chatbot_search_new.py`
-
-At the top of **`code/chatbot_agents/chatbot_search_new.py`**, where you already import prompts, make sure you have **all** of these:
-
-```python
-from prompt_list import (
-    main_intent_classifier,              # intent classification (greeting/contact/about/…)
-    query_type_classification_prompt,    # standalone / follow_up / under_specified
-    query_decontextualization_prompt,    # uses HISTORY
-    query_rewrite_no_history_prompt,     # rewrite with NO history
-    clarification_underspecified_prompt, # “this is too vague” clarifier
-    clarification_followup_prompt,       # “you’re referring to earlier context” clarifier
-)
-```
-
-Names need to match whatever you actually used in `prompt_list.py` – adjust if you named them slightly differently.
+Let me break it down on your actual pipeline.
 
 ---
 
-## 2. One small shared LLM helper (in `chatbot_search_new.py`)
+## 1. Where the classification currently takes effect
 
-Somewhere near the top (after imports and env config), add this tiny helper if you don’t already have an equivalent:
+Your flow right now (for non-greeting / non-conclusion) is roughly:
 
-```python
-import openai
-import os
+1. **Intent classifier**
+   `SearchAgent.classify_query_type(query)` → `intent`
 
-AZURE_CHAT_DEPLOYMENT = os.getenv("AZURE_CHAT_DEPLOYMENT", "gpt-4.1-mini")
+   * `greeting` / `conclusion` → go straight to `generate_exigotech_answer` with greeting/conclusion prompt (no RAG).
+   * else → continue.
 
+2. Call **`hybrid_query_search(...)`**
+   Inside that controller you do:
 
-async def _call_llm_zero_temp(prompt: str, max_tokens: int = 256) -> str:
-    """Single helper to call Azure Chat with a raw prompt, temp=0."""
-    resp = await openai.ChatCompletion.acreate(
-        engine=AZURE_CHAT_DEPLOYMENT,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-        max_tokens=max_tokens,
-    )
-    return resp["choices"][0]["message"]["content"].strip()
-```
+   * Run **query_type classifier** (standalone / follow_up / under_specified) using `query_type_classification_prompt`.
+   * Possibly decontextualize if it’s follow_up.
+   * If **`under_specified`** → you *don’t even call vector search*; you return
+     `search_metadata["needs_clarification"] = True` and a clarification question.
+   * If **not under_specified** → then you run **pgvector search + rerank**, and only after that you go to `generate_exigotech_answer`.
 
-This is what all the new prompts will use.
+So:
 
----
+> “May be after having no results for vector search ? And before llm generation?”
 
-## 3. History-aware query processing
+No – in your current design, **query-type classification gates the search itself**. It is *before* vector search and before answer generation.
 
-You already have the high-level controller (based on our architecture):
+If you instead did:
 
-* `process_query_with_context(query, history, relevance_threshold)`
-* `contextualize_query(query, history, relevance_threshold)` or similar
+* always search,
+* and only if results are empty/weak, then ask clarification,
 
-We’re going to plug the prompts in there.
+you’d be doing an extra embedding + DB hit for lots of bad/vague questions. That’s slower and more expensive. The current design is correct:
+**filter obviously under-specified queries *before* wasting RAG.**
 
-### 3.1 Query-form classifier (standalone / follow_up / under_specified)
-
-Add this function in `chatbot_search_new.py`:
-
-```python
-async def classify_query_form(query: str) -> str:
-    """
-    Use query_type_classification_prompt to decide:
-    - 'standalone'
-    - 'follow_up'
-    - 'under_specified'
-    """
-    prompt = query_type_classification_prompt.replace("{query}", query)
-    raw = await _call_llm_zero_temp(prompt, max_tokens=8)
-    label = raw.strip().lower()
-    if "follow_up" in label:
-        return "follow_up"
-    if "under" in label:  # under_specified
-        return "under_specified"
-    return "standalone"
-```
-
-### 3.2 Decontextualize WITH history
-
-This is where history is actually used:
-
-```python
-def _history_to_text(history: list[dict]) -> str:
-    """Turn DB history rows into a compact text snippet for the prompt."""
-    lines = []
-    for msg in history[-6:]:  # last few exchanges only
-        role = msg.get("role") or msg.get("speaker") or "user"
-        content = msg.get("content") or msg.get("text") or ""
-        lines.append(f"{role.capitalize()}: {content}")
-    return "\n".join(lines)
-
-
-async def decontextualize_query_with_history(query: str, history: list[dict]) -> str:
-    """
-    Use query_decontextualization_prompt to rewrite the query into a
-    standalone version, using ONLY relevant history snippet.
-    """
-    history_text = _history_to_text(history)
-    prompt = (
-        query_decontextualization_prompt
-        .replace("{query}", query)
-        .replace("{history}", history_text)
-    )
-    rewritten = await _call_llm_zero_temp(prompt, max_tokens=128)
-    return rewritten.strip()
-```
-
-### 3.3 Rewrite WITHOUT history
-
-Used for “standalone but messy” queries (acronyms, partial phrases, etc.):
-
-```python
-async def rewrite_query_no_history(query: str) -> str:
-    """
-    Use query_rewrite_no_history_prompt to clean up a standalone query
-    (expand abbreviations, make it search-ready) WITHOUT adding history.
-    """
-    prompt = query_rewrite_no_history_prompt.replace("{query}", query)
-    rewritten = await _call_llm_zero_temp(prompt, max_tokens=128)
-    return rewritten.strip()
-```
-
-### 3.4 Clarification question generators
-
-We’ll use these when query is under-specified or refers to missing context:
-
-```python
-async def generate_underspecified_clarification(query: str) -> str:
-    prompt = clarification_underspecified_prompt.replace("{query}", query)
-    question = await _call_llm_zero_temp(prompt, max_tokens=64)
-    return question.strip()
-
-
-async def generate_followup_clarification(query: str) -> str:
-    prompt = clarification_followup_prompt.replace("{query}", query)
-    question = await _call_llm_zero_temp(prompt, max_tokens=64)
-    return question.strip()
-```
+We *can* add an **extra clarification** layer when search returns garbage, but that’s a *second* safety net, not a replacement.
 
 ---
 
-## 4. Wire everything into `process_query_with_context`
+## 2. Is this only about `page` intent?
 
-Find your controller function (name might be exactly this, or very close).
-We want it to:
+The *override I gave* (`is_generic_services_question`) is intentionally restricted to `intent == "page"` because:
 
-1. Classify **form**: standalone / follow_up / under_specified
-2. Filter history by relevance
-3. Decide whether to:
+* Those patterns are clearly “tell me about your services / offerings” → should hit **services pages**.
+* For **career**, **about**, **case**, the patterns are different.
+  You don’t want a “services” override polluting those.
 
-   * ask for clarification, OR
-   * rewrite with history, OR
-   * rewrite without history
+So:
 
-Here is a drop-in version you can adapt (keep the signature you already use):
+* 🔒 **Core logic (standalone/follow_up/under_specified)** is used for *all* intents that go through RAG (page, about, career, case, contact-info style, etc.)
+* 🛠 **Special override** for “generic services questions” is **only for `page`** because that’s exactly the use-case you’re fixing right now:
+  user asks “what services do you offer?”, you want:
+
+  * no clarification
+  * just a good answer based on the **root services/core offerings** pages.
+
+Later, you *can* add similar tiny helpers if you see problems like:
+
+* generic **career** question: “what jobs do you have?” → always treat as standalone career, not under_specified.
+* generic **about** question: “tell me about your company” → standalone about, not under_specified.
+
+But those should be separate, small, **intent-specific overrides**, not one giant rule that fires everywhere.
+
+---
+
+## 3. Why not “only after no results”?
+
+You suggested:
+
+> “this classification really needs to takes effect ? May be after having no results for vector search ?”
+
+Problems if we do that:
+
+1. **Latency** – you still:
+
+   * embed query
+   * hit pgvector
+   * maybe rerank
+     just to find out “oh it was vague, now ask clarification”. That’s exactly the waste you’re trying to avoid.
+
+2. **No guarantee of ‘no results’** – pgvector will *always* return something if your DB is non-empty.
+   “What is it?” might pull some random page that happens to have high vector similarity.
+   You’d then *incorrectly* run `generate_exigotech_answer` on garbage, instead of admitting the question is underspecified.
+
+3. **You already have a designed place** for this:
+   `query_type == "under_specified"` → **ask clarifying question early**.
+
+So the right architecture is:
+
+1. intent classification (what kind of info?)
+2. query-type classification (how complete / follow-up?)
+3. **if under_specified → clarification**
+4. else → vector search + rerank
+5. then → `generate_exigotech_answer` with proper intent prompt.
+
+What we’re doing now is just tightening step 2–3 with intent-specific overrides so that “good” generic questions (like “what services do you offer?”) **don’t get stuck in clarification**.
+
+---
+
+## 4. Where exactly to plug the override
+
+To ground it:
+
+* The **override** belongs inside your **context controller** (`process_query_with_context` / `hybrid_query_search`), right after you have **intent + query_type**, and **before** you decide `needs_clarification`.
+
+Conceptually:
 
 ```python
-async def process_query_with_context(
-    query: str,
-    history: list[dict],
-    relevance_threshold: float = 0.55,
-) -> tuple[str, dict]:
+query_intent = classify_intent(...)
+query_type   = classify_query_type(...)
+
+# Intent-specific safety net
+if is_generic_services_question(original_query, query_intent):
+    query_type = "standalone"
+
+if query_type == "under_specified" and not is_generic_services_question(...):
+    # ask clarification
+else:
+    # proceed with search + answer
+```
+
+This way:
+
+* All intents still use the same clean logic.
+* Only **page+services** questions get the “never clarify, just answer from services pages” treatment.
+
+---
+
+So, to answer your “am I wrong?”:
+
+* You were right to question *where* the classification should apply. It **must** be before search, not after “no results”.
+* You were mixing “page-services problem” with “all intents”. The *bug* you’re seeing right now is specific to **services questions**, so the fix is rightly `intent == "page"` + override.
+* The pattern (prompt rule + tiny override) is reusable for careers/about later, but we don’t generalize it blindly yet.
+
+If you want, next we can:
+
+* Add similar micro-overrides for **career** (“what job openings do you have?”) and **about** (“tell me about your company”) once you see them misclassified, and
+* Tune `page_intent_prompt` so it always prefers the root services page for those generic questions and only dives into sub-services when the user asks specifically.
+
+
+
+
+
+
+
+You’re 100% right to be annoyed by that behaviour.
+If the user asks *“what are the services provided?”* the bot must **just answer** (services overview), not start playing 20 questions.
+
+Right now the reason you see clarifications in the logs is:
+
+* Intent classifier → `page` ✅
+* **Query-type classifier** → `under_specified` ❌ (because it thinks “services” is too vague)
+* `hybrid_query_search` sees `under_specified` → sets `needs_clarification=True` → you get the annoying “which services…” question
+
+We fix this in two places so it’s reliable:
+
+---
+
+## 1. Make the LLM explicitly treat generic service questions as STANDALONE
+
+In `prompt_list.py` for `query_type_classification_prompt`, make sure we have VERY explicit rules + examples like:
+
+```python
+query_type_classification_prompt = """
+You are a query analyzer for Exigotech chatbot.
+
+Classify the user query into exactly ONE of these types:
+1. "standalone"
+2. "follow_up"
+3. "under_specified"
+
+Rules summary:
+
+- Treat any generic question about Exigotech's services or offerings as **standalone**, even if no specific service name is mentioned.
+  Examples that MUST be "standalone":
+  - "what are the services provided"
+  - "what services do you offer"
+  - "what services does Exigotech provide"
+  - "tell me about your services"
+  - "what are your core offerings"
+  - "what solutions do you provide"
+
+- "follow_up":
+  - Query refers to earlier conversation (pronouns like he/she/it/they/that/this, "the above", "previous one", etc.)
+  - Needs previous Q/A to be understood.
+
+- "under_specified":
+  - Query is too vague to answer even if we assume it is about Exigotech.
+  - No clear subject, e.g. "what about it", "tell me more", "I want details" with no service/person/topic.
+
+Return ONLY the type: standalone, follow_up, or under_specified.
+No explanations, no extra text.
+"""
+```
+
+This alone will reduce a lot of bad “under_specified” labels.
+
+---
+
+## 2. Add a hard override in code so those questions **never** trigger clarification
+
+Even with a good prompt, I don’t trust any LLM 100%. So we add a tiny, deterministic rule in **Python** that says:
+
+> If intent is `page` **and** the raw query clearly looks like “what services do you offer?” → **force `query_type="standalone"`** and skip clarification.
+
+### Step 2a – Add helper in `chatbot_search_new.py`
+
+Near the top of `chatbot_search_new.py` (with other helpers), add:
+
+```python
+def is_services_overview_query(text: str) -> bool:
     """
-    Main controller for query → (possibly rewritten query, metadata).
-
-    Returns:
-      processed_query: str  (may be same as input)
-      meta: {
-        "needs_clarification": bool,
-        "clarification_question": Optional[str],
-        "query_form": "standalone|follow_up|under_specified",
-      }
+    Detect generic 'what services do you offer' type questions.
+    These should always be treated as standalone, not under-specified.
     """
-    meta: dict[str, any] = {
-        "needs_clarification": False,
-        "clarification_question": None,
-        "query_form": None,
-    }
+    if not text:
+        return False
 
-    # 1) Classify query form
-    query_form = await classify_query_form(query)
-    meta["query_form"] = query_form
+    t = text.lower().strip()
 
-    # 2) Filter history by relevance (you already have this function)
-    filtered_history = filter_history_by_relevance(
-        history=history,
-        query=query,
-        threshold=relevance_threshold,
-    )
+    patterns = [
+        "what are the services provided",
+        "what services do you provide",
+        "what services do you offer",
+        "what services does exigotech provide",
+        "tell me about your services",
+        "what are your services",
+        "what are your core offerings",
+        "what are the core offerings",
+        "what solutions do you provide",
+        "what solutions do you offer",
+        "what are the solutions you provide",
+    ]
 
-    # 3) If underspecified → clarification only
-    if query_form == "under_specified":
-        clar_q = await generate_underspecified_clarification(query)
-        meta["needs_clarification"] = True
-        meta["clarification_question"] = clar_q
-        # We still return original query; caller will short-circuit.
-        return query, meta
-
-    # 4) Follow-up: needs history
-    if query_form == "follow_up":
-        if filtered_history:
-            rewritten = await decontextualize_query_with_history(query, filtered_history)
-            return rewritten, meta
-        else:
-            # Query refers to something, but we have no usable history
-            clar_q = await generate_followup_clarification(query)
-            meta["needs_clarification"] = True
-            meta["clarification_question"] = clar_q
-            return query, meta
-
-    # 5) Standalone: no history; just clean rewrite
-    rewritten = await rewrite_query_no_history(query)
-    return rewritten, meta
+    return any(p in t for p in patterns)
 ```
+
+### Step 2b – Use it inside your context controller
+
+Find the place in `hybrid_query_search` (or `process_query_with_context`, depending on your version) where you:
+
+* already have `query_intent` (from `SearchAgent`)
+* call the query-type classifier and get `query_type`
+* decide whether to ask clarification or not
+
+It’ll look roughly like:
+
+```python
+query_type = await classify_query_type_llm(query)
+
+if query_type == "under_specified":
+    # build clarification question
+    search_metadata["needs_clarification"] = True
+    search_metadata["clarification_question"] = ...
+    return query, [], search_metadata
+```
+
+Right **before** you check for `under_specified`, inject:
+
+```python
+# Hard override: services overview questions should never be treated as under_specified.
+if isinstance(query_intent, str) and query_intent.lower() == "page":
+    if is_services_overview_query(original_query or query):
+        query_type = "standalone"
+```
+
+So the whole block ends up like:
+
+```python
+query_type = await classify_query_type_llm(query)
+
+# Hard override for generic services questions on page intent
+if isinstance(query_intent, str) and query_intent.lower() == "page":
+    if is_services_overview_query(original_query or query):
+        query_type = "standalone"
+
+if query_type == "under_specified":
+    # ask clarification instead of RAG
+    search_metadata["needs_clarification"] = True
+    search_metadata["clarification_question"] = clarification_question
+    return query, [], search_metadata
+```
+
+> **Key point:** we only override when
+> `intent == "page"` **AND** the raw text matches our patterns.
+> Everything else still uses your clean follow_up / under_specified logic.
 
 ---
 
-## 5. Use `process_query_with_context` inside `hybrid_query_search`
+## What this guarantees
 
-Now, inside your `hybrid_query_search` (or whatever you call the RAG entrypoint) you should already be doing something like:
+With those two changes:
 
-```python
-processed_query, results, search_metadata = await hybrid_query_search(
-    query=query,
-    history=session_history_snapshot,
-    ...
-)
-```
+* **“what are the services provided”**
+* **“what services do you offer”**
+* **“tell me about your services”**
 
-Make sure the **first step** in that function is now:
+will always:
 
-```python
-async def hybrid_query_search(...):
-    # 0) Contextualize query first (includes history + clarification logic)
-    processed_query, ctx_meta = await process_query_with_context(
-        query=query,
-        history=history,
-        relevance_threshold=0.55,
-    )
+1. classify as `intent="page"`,
+2. be forced to `query_type="standalone"`,
+3. go straight into: history-filter → vector search → rerank → `generate_exigotech_answer` (page-intent prompt),
+4. no clarification step.
 
-    # If clarification needed → bubble this up immediately
-    if ctx_meta.get("needs_clarification"):
-        return processed_query, [], {
-            "needs_clarification": True,
-            "clarification_question": ctx_meta.get("clarification_question"),
-        }
+Clarification is kept only for *truly* bad questions like:
 
-    # 1) Embed processed_query, run vector search, rerank, etc.
-    ...
-```
+* “tell me more” (after some answer, with no subject)
+* “what about that”
+* “can you explain more” (no target)
 
-You already have the “clarification” handling in `chatbot_api.py` (checking `search_metadata["needs_clarification"]`), so this fits directly.
+Those are the ones that actually need, “Which service / person are you asking about?”.
 
----
-
-## 6. Where the **about_person_intent_prompt** goes
-
-This is **not** in `chatbot_search_new.py` – it lives in your answer generator:
-
-`code/chatbot_agents/exigotech_chatbot.py`
-
-You already have logic like:
-
-```python
-from prompt_list import (
-    greeting_response_prompt,
-    conclusion_response_prompt,
-    contact_intent_prompt,
-    about_intent_prompt,         # old one
-    career_intent_prompt,
-    page_intent_prompt,
-    case_intent_prompt,
-    # ...
-)
-```
-
-Now:
-
-1. Replace the old `about_intent_prompt` import with your new `about_person_intent_prompt`.
-2. In `generate_exigotech_answer`, where you choose which prompt to use based on `intent`, make sure:
-
-```python
-elif intent == "about":
-    prompt = about_person_intent_prompt
-```
-
-That ensures:
-
-* For intent “about”, the LLM uses the **person/team** style prompt with:
-
-  * `answer`
-  * `key_points`
-  * `contact_suggestion`
-  * `related_services`
-  * `fallback`
-
-Later we can update `run_exigotech_prompt` to parse the JSON and feed it cleanly to UI / mapped buttons, but wiring the prompt first is step one.
-
----
-
-## 7. Quick mental check: history use vs no-history use
-
-* **History used only here:**
-
-  * `decontextualize_query_with_history(...)` → called **only** when:
-
-    * classifier says `follow_up`, AND
-    * `filter_history_by_relevance` returns something above threshold
-
-* **No history:**
-
-  * `rewrite_query_no_history(...)` for standalone queries
-  * contact classification, intent classification, about intent, etc. stay context-free or RAG-only
-
-So your **“Yes” to contact** will **not** randomly trigger when the user is just saying “yes tell me more about that service” — because:
-
-1. Intent classifier sees it as `follow_up`,
-2. Contextualizer uses history and rewrites to a proper standalone question about that service,
-3. Only your **micro_llm** contact classifier decides if the last exchange really was a contact offer, and we already narrowed that logic.
-
----
-
-If you paste these blocks into the right places and keep the function names consistent with what you already have, your new prompts are now fully “in the loop”:
-
-* History-aware decontextualization where it matters
-* Minimal rewrite for clean queries
-* Clarification instead of guessing
-* About-person answers that include key points + related services + contact hints
-
-If you hit any concrete error (NameError, import issue, etc.), paste the traceback or the relevant 20–30 lines and I’ll fix it surgically.
+If you show me the exact block around your `query_type` handling in `chatbot_search_new.py`, I can wire this override into your real code instead of pseudo-code.
