@@ -1,42 +1,154 @@
-def _normalize_reply(s: str) -> str:
-    return s.strip().lower()
+Perfect, let’s wire the *small-model classifier* in cleanly.
+We’ll do exactly what you asked: **small patches, with clear anchors.**
+
+We’ll do three things now:
+
+1. Create `chatbot_agents/micro_llm.py`
+2. Import it in `chatbot_api.py`
+3. Patch `llm_contact_reply_classifier` to use it
+
+Prompts stay as-is for now. No behaviour change to RAG, only better contact reply handling.
+
+---
+
+## 1️⃣ New file: `chatbot_agents/micro_llm.py`
+
+**Create a new file** at:
+`code/chatbot_agents/micro_llm.py` (same folder as `exigotech_chatbot.py`)
+
+Paste this inside:
+
+```python
+# chatbot_agents/micro_llm.py
+
+import os
+import logging
+from typing import Literal
+
+import httpx
+
+logger = logging.getLogger(__name__)
+
+# ENV config (you can tweak names if you prefer)
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_CONTACT_MODEL = os.getenv("OLLAMA_CONTACT_MODEL", "llama3.2:latest")
+USE_OLLAMA = os.getenv("USE_OLLAMA_CONTACT", "true").lower() in {"1", "true", "yes"}
 
 
-def fast_reply_classifier(text: str) -> str:
+ReplyDecision = Literal["confirm", "decline", "other"]
+
+
+async def _call_ollama_contact_classifier(prompt: str) -> ReplyDecision:
     """
-    Cheap rule-based classifier for replies to a contact offer.
-    Returns: 'confirm', 'decline', or 'ambiguous'.
+    Call Ollama's /api/chat endpoint with a small model to classify
+    contact replies. Expects the model to return exactly one word:
+    'confirm', 'decline', or 'other'.
     """
-    q = _normalize_reply(text)
+    if not USE_OLLAMA:
+        return "other"
 
-    confirm_strict = {
-        "yes",
-        "y",
-        "yeah",
-        "yep",
-        "sure",
-        "ok",
-        "okay",
-        "please do",
-    }
-    decline_strict = {
-        "no",
-        "n",
-        "nope",
-        "not now",
-        "never mind",
-        "cancel",
-        "no thanks",
-        "no thank you",
-    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{OLLAMA_BASE_URL}/api/chat",
+                json={
+                    "model": OLLAMA_CONTACT_MODEL,
+                    "messages": [
+                        {"role": "user", "content": prompt},
+                    ],
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            # Ollama chat response format: {'message': {'role': 'assistant', 'content': '...'}, ...}
+            content = (
+                data.get("message", {})
+                .get("content", "")
+                .strip()
+                .lower()
+            )
+    except Exception as e:
+        logger.warning("Ollama contact classifier failed: %s", e)
+        return "other"
 
-    if q in confirm_strict:
+    if content.startswith("confirm"):
         return "confirm"
-    if q in decline_strict:
+    if content.startswith("decline"):
         return "decline"
-    return "ambiguous"
+    if content.startswith("other"):
+        return "other"
+
+    # Fallback if model returned something funky
+    return "other"
 
 
+async def classify_contact_reply_small(
+    offer_text: str,
+    reply: str,
+) -> ReplyDecision:
+    """
+    Public helper used by chatbot_api.
+
+    Takes the original contact offer text + user reply,
+    and returns 'confirm', 'decline', or 'other'.
+    """
+    prompt = f"""
+You classify a customer's reply to a contact offer.
+
+Offer to the user:
+\"\"\"{offer_text}\"\"\"
+
+User's reply:
+\"\"\"{reply}\"\"\"
+
+Classify the reply as exactly one of:
+- confirm : user clearly agrees to be contacted now
+- decline : user clearly refuses or postpones contact
+- other   : unclear, mixed, off-topic, or not really about the contact
+
+Return ONLY one word: confirm, decline, or other.
+"""
+    return await _call_ollama_contact_classifier(prompt)
+```
+
+### Optional `.env` additions (just add, don’t change anything else yet)
+
+Later, in your `.env`, you can add:
+
+```env
+USE_OLLAMA_CONTACT=true
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_CONTACT_MODEL=llama3.2:latest
+```
+
+But you don’t *have* to set them immediately; the code defaults to `other` if Ollama is off.
+
+---
+
+## 2️⃣ Update imports in `chatbot_api.py`
+
+### 🔍 Find this block near the top:
+
+```python
+from pgvector_helper.db_logger import get_db_logger
+from chatbot_agents.exigotech_chatbot import generate_exigotech_answer
+```
+
+### 🧩 Patch: insert ONE new import **right after** it:
+
+```python
+from pgvector_helper.db_logger import get_db_logger
+from chatbot_agents.exigotech_chatbot import generate_exigotech_answer
+from chatbot_agents.micro_llm import classify_contact_reply_small
+```
+
+---
+
+## 3️⃣ Patch `llm_contact_reply_classifier` in `chatbot_api.py`
+
+You already have this stub function:
+
+```python
 async def llm_contact_reply_classifier(offer_text: str, reply: str) -> str:
     """
     Stub for small-LLM-based classification of ambiguous replies.
@@ -48,207 +160,523 @@ async def llm_contact_reply_classifier(offer_text: str, reply: str) -> str:
     """
     # TODO: implement with a small model (Ollama or gpt-4.1-mini)
     return "other"
+```
+
+### 🔁 Replace that entire function with this:
+
+```python
+async def llm_contact_reply_classifier(offer_text: str, reply: str) -> str:
+    """
+    Delegate ambiguous reply classification to a small LLM
+    (Ollama or any cheap model via micro_llm).
+    """
+    try:
+        decision = await classify_contact_reply_small(offer_text, reply)
+        # safety: normalize unexpected outputs
+        if decision not in ("confirm", "decline", "other"):
+            return "other"
+        return decision
+    except Exception as e:
+        logger.warning("llm_contact_reply_classifier failed: %s", e)
+        return "other"
+```
+
+That’s it.
+
+Your earlier logic in `summarize()`:
+
+```python
+decision = fast_reply_classifier(query)
+
+if decision == "ambiguous":
+    decision = await llm_contact_reply_classifier(
+        pending_offer.get("offer_text", ""),
+        query,
+    )
+```
+
+Now automatically leverages Ollama when:
+
+* There is a pending offer, AND
+* The reply is not a clean yes/no.
+
+---
+
+## ✅ What you have now
+
+* `fast_reply_classifier` handles obvious **“yes / no”** quickly and deterministically.
+* For weird replies (“yes but later”, “okay I guess so”, “sure if needed”):
+
+  * It calls `llm_contact_reply_classifier` → `classify_contact_reply_small` → small model via Ollama.
+* If Ollama is not running / env not set / error:
+
+  * It safely falls back to `"other"` and does **not** break your RAG flow.
+
+Your pipeline is now:
+
+* More robust to human mess
+* Cheaper (small model)
+* Cleaner separation of responsibilities
+
+---
+
+If this compiles and runs fine, next we can:
+
+* Either move on to **`generate_exigotech_answer`** refactor
+* Or strengthen `_extract_result_urls` / internal answers
+* Or start planning the final prompt tweaks
+
+You tell me what you want to tackle next, and I’ll stay in patch mode.
+Nice, this is exactly the right thing to care about: **switch providers via `.env`, no code rewrites.**
+
+We’ll do two things:
+
+1. Design **.env switches** so you can toggle: `ollama` ↔ `openai` easily.
+2. Make `micro_llm.py` **read those switches** and route to the right small model.
+
+I’ll also suggest a cheap GPT model that’s more than enough for this classifier.
+
+---
+
+## 1️⃣ .env design – provider switch
+
+Add these env vars (you can tweak names, but I’ll assume these):
+
+```env
+# Which small model provider to use for contact / small-classification tasks
+# Options: ollama, openai
+SMALL_LLM_PROVIDER=ollama
+
+# ---- OLLAMA settings ----
+USE_OLLAMA_CONTACT=true
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_CONTACT_MODEL=llama3.2:latest
+
+# ---- OPENAI settings (only used if SMALL_LLM_PROVIDER=openai) ----
+OPENAI_API_KEY=sk-xxx   # if you're using direct OpenAI
+SMALL_LLM_MODEL=gpt-4.1-mini
+```
+
+So:
+
+* If `SMALL_LLM_PROVIDER=ollama` → we use your local Ollama model.
+* If `SMALL_LLM_PROVIDER=openai` → we call OpenAI’s **gpt-4.1-mini** by default.
+
+> ✅ Recommendation: **`gpt-4.1-mini`** (or `gpt-4o-mini` if you have it) is perfect here:
+> extremely cheap, fast, and more than enough for “confirm/decline/other” classification.
+
+---
+
+## 2️⃣ Update `micro_llm.py` to be provider-aware
+
+Since this file is still small and new, it’s simplest to **replace its entire content** with the flexible version below.
+
+### 🔧 Open `code/chatbot_agents/micro_llm.py` and replace everything with:
+
+```python
+# chatbot_agents/micro_llm.py
+
+import os
+import logging
+from typing import Literal
+
+import httpx
+
+try:
+    # If OpenAI python client is installed, we can use it for SMALL_LLM_PROVIDER=openai
+    from openai import AsyncOpenAI
+except ImportError:
+    AsyncOpenAI = None
+
+logger = logging.getLogger(__name__)
+
+# -------------------------------------------------------------------
+# ENV config
+# -------------------------------------------------------------------
+
+ReplyDecision = Literal["confirm", "decline", "other"]
+
+SMALL_LLM_PROVIDER = os.getenv("SMALL_LLM_PROVIDER", "ollama").lower()
+
+# OLLAMA config
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_CONTACT_MODEL = os.getenv("OLLAMA_CONTACT_MODEL", "llama3.2:latest")
+USE_OLLAMA = os.getenv("USE_OLLAMA_CONTACT", "true").lower() in {"1", "true", "yes"}
+
+# OPENAI config (only used if SMALL_LLM_PROVIDER == "openai")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+SMALL_LLM_MODEL = os.getenv("SMALL_LLM_MODEL", "gpt-4.1-mini")
 
 
-Handle pending contact offer at the top of summarize
-
-Now, inside summarize, right after you get sid, msg_count, and state, we add logic that intercepts “yes/no” before RAG.
-
-Find this block:
-
-        # 2) DB-based counters (used for potential business heuristics)
-        msg_count = await get_msg_count(sid)
-        state = get_session_state(sid)
-        business_count = int(state.get("business_count", 0))
-
-        # 3) Lookup mapped question (from previous related-services buttons)
-        mapped_question = lookup_mapped_question(sid, query)
+# -------------------------------------------------------------------
+# Ollama path
+# -------------------------------------------------------------------
 
 
-Replace it with this extended block:
+async def _call_ollama_contact_classifier(prompt: str) -> ReplyDecision:
+    """
+    Call Ollama's /api/chat endpoint with a small model to classify
+    contact replies. Expects the model to return exactly one word:
+    'confirm', 'decline', or 'other'.
+    """
+    if not USE_OLLAMA:
+        return "other"
 
-        # 2) DB-based counters (used for potential business heuristics)
-        msg_count = await get_msg_count(sid)
-        state = get_session_state(sid)
-        business_count = int(state.get("business_count", 0))
-
-        # 2a) Handle replies to a pending contact offer BEFORE RAG
-        pending_offer = state.get("pending_contact_offer")
-        if pending_offer:
-            decision = fast_reply_classifier(query)
-
-            if decision == "ambiguous":
-                # Escalate to small LLM later (stub for now)
-                decision = await llm_contact_reply_classifier(
-                    pending_offer.get("offer_text", ""),
-                    query,
-                )
-
-            if decision == "confirm":
-                # User clearly agreed to contact
-                state["pending_contact_offer"] = None
-
-                confirm_msg = (
-                    f"Great! I'll connect you with our team about "
-                    f"{pending_offer.get('service_name', 'this service')}.\n\n"
-                    "Please share your email and phone number so our team can reach out."
-                )
-
-                await push_user(sid, query)
-                await push_assistant_sanitized(sid, confirm_msg)
-
-                return {
-                    "summary": confirm_msg,
-                    "useful_links": [],
-                    "mapped_questions": {},
-                    "needs_clarification": False,
-                    "inside_contact_flow": True,
-                    "needs_contact_details": True,
-                }
-
-            if decision == "decline":
-                # User declined the offer
-                state["pending_contact_offer"] = None
-
-                decline_msg = (
-                    "No worries, I won’t connect you right now. "
-                    "You can continue exploring services or ask anything else."
-                )
-
-                await push_user(sid, query)
-                await push_assistant_sanitized(sid, decline_msg)
-
-                return {
-                    "summary": decline_msg,
-                    "useful_links": [],
-                    "mapped_questions": {},
-                    "needs_clarification": False,
-                    "inside_contact_flow": False,
-                }
-
-            # decision == 'other' → user moved on; drop offer and continue normally
-            state["pending_contact_offer"] = None
-
-        # 3) Lookup mapped question (from previous related-services buttons)
-        mapped_question = lookup_mapped_question(sid, query)
-
-
-So now:
-
-If a contact offer was active,
-
-and user sends “yes” / “no” / “maybe yes-ish”,
-
-we handle that separately and do not send it into RAG.
-
-For now ambiguous replies are treated as "other" (no special handling).
-Later we’ll wire the small LLM so "ambiguous" can become "confirm" or "decline".
-
-3️⃣ Set pending_contact_offer when we inject contact button
-
-Scroll down to step 10 in summarize, where we inject the contact button:
-
-        # 10) Optional contact-button injection (still just label -> question)
-        if isinstance(parsed_json, dict):
-            lowered_query = (processed_query or "").lower()
-            business_keywords = (
-                "price",
-                "pricing",
-                "license",
-                "licence",
-                "quote",
-                "demo",
-                "cost",
-                "sales",
-                "buy",
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{OLLAMA_BASE_URL}/api/chat",
+                json={
+                    "model": OLLAMA_CONTACT_MODEL,
+                    "messages": [
+                        {"role": "user", "content": prompt},
+                    ],
+                },
             )
-            is_business_like = any(k in lowered_query for k in business_keywords)
-
-            intent_str = (
-                query_intent.lower()
-                if isinstance(query_intent, str)
-                else ""
+            resp.raise_for_status()
+            data = resp.json()
+            # Ollama chat response format: {'message': {'role': 'assistant', 'content': '...'}, ...}
+            content = (
+                data.get("message", {})
+                .get("content", "")
+                .strip()
+                .lower()
             )
+    except Exception as e:
+        logger.warning("Ollama contact classifier failed: %s", e)
+        return "other"
 
-            should_inject_contact = is_business_like or intent_str in ("contact",)
+    if content.startswith("confirm"):
+        return "confirm"
+    if content.startswith("decline"):
+        return "decline"
+    if content.startswith("other"):
+        return "other"
 
-            if should_inject_contact and "contact" not in parsed_json:
-                # Try to grab a main service name from existing buttons
-                service_names = list(parsed_json.keys())
-                if service_names:
-                    main_service = service_names[0]
-                else:
-                    main_service = (
-                        processed_query[:80]
-                        if processed_query
-                        else "Exigotech services"
-                    )
-
-                contact_label = f"Contact about {main_service}"
-                contact_question = (
-                    f"How can I contact Exigotech sales team about {main_service}?"
-                )
-
-                parsed_json[contact_label] = contact_question
+    # Fallback if model returned something unexpected
+    return "other"
 
 
-👉 We keep all of this, and add one tiny block at the end of the if should_inject_contact...:
+# -------------------------------------------------------------------
+# OpenAI (or compatible) path
+# -------------------------------------------------------------------
 
-                parsed_json[contact_label] = contact_question
 
-                # Mark a pending contact offer for the *next* user reply
-                state["pending_contact_offer"] = {
-                    "service_name": main_service,
-                    "offer_text": contact_question,
+async def _call_openai_contact_classifier(prompt: str) -> ReplyDecision:
+    """
+    Use OpenAI's small model (e.g., gpt-4.1-mini) to classify the reply.
+    Expects the model to return one word: confirm / decline / other.
+    """
+    if not OPENAI_API_KEY or AsyncOpenAI is None:
+        logger.warning(
+            "OPENAI_API_KEY not set or openai client not installed; "
+            "falling back to 'other'."
+        )
+        return "other"
+
+    client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+    try:
+        resp = await client.chat.completions.create(
+            model=SMALL_LLM_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
                 }
+            ],
+            max_tokens=4,
+        )
+        content = (
+            resp.choices[0]
+            .message
+            .content.strip()
+            .lower()
+        )
+    except Exception as e:
+        logger.warning("OpenAI contact classifier failed: %s", e)
+        return "other"
+
+    if content.startswith("confirm"):
+        return "confirm"
+    if content.startswith("decline"):
+        return "decline"
+    if content.startswith("other"):
+        return "other"
+
+    return "other"
 
 
-So now, whenever we inject a “Contact about X” button, we also record in session:
-
-state["pending_contact_offer"] = {
-    "service_name": "...",
-    "offer_text": "How can I contact Exigotech sales team about ...?"
-}
+# -------------------------------------------------------------------
+# Public API used by chatbot_api
+# -------------------------------------------------------------------
 
 
-On the next user message:
+async def classify_contact_reply_small(
+    offer_text: str,
+    reply: str,
+) -> ReplyDecision:
+    """
+    Public helper used by chatbot_api.
 
-If they just click the button → the UI will send the mapped question (good, still goes through RAG).
+    Takes the original contact offer text + user reply,
+    and returns 'confirm', 'decline', or 'other' using
+    whichever SMALL_LLM_PROVIDER is configured.
+    """
+    prompt = f"""
+You classify a customer's reply to a contact offer.
 
-If they type “yes” / “no” / “yes please” → our new layer intercepts it and handles as contact reaction.
+Offer to the user:
+\"\"\"{offer_text}\"\"\"
 
-4️⃣ What’s working now (even before small LLM is added)
+User's reply:
+\"\"\"{reply}\"\"\"
 
-After these edits:
+Classify the reply as exactly one of:
+- confirm : user clearly agrees to be contacted now
+- decline : user clearly refuses or postpones contact
+- other   : unclear, mixed, off-topic, or not really about the contact
 
-✅ Contact buttons still work as before (mapped_questions & mapping store unchanged).
+Return ONLY one word: confirm, decline, or other.
+"""
 
-✅ A “Contact about X” injection now also sets pending_contact_offer.
+    provider = SMALL_LLM_PROVIDER
 
-✅ If the bot shows a contact CTA and the user replies with:
+    if provider == "ollama":
+        return await _call_ollama_contact_classifier(prompt)
 
-“yes” / “yeah” / “ok” / “no” / “nope” / “not now”,
-→ handled without going into RAG.
+    if provider == "openai":
+        return await _call_openai_contact_classifier(prompt)
 
-✅ For weird replies (“yes but later”), we currently treat them as “other” and just drop the pending offer, then continue normally.
+    # Unknown provider = safe fallback
+    logger.warning(
+        "SMALL_LLM_PROVIDER=%s not recognized, falling back to 'other'",
+        provider,
+    )
+    return "other"
+```
 
-🚧 Later, when we plug in Ollama or GPT-mini inside llm_contact_reply_classifier, those ambiguous cases will be upgraded to smart “confirm/decline” classification.
+---
 
-Nothing else in your pipeline changes.
-No prompts changed yet.
-No .env changes needed for this step.
+## 3️⃣ chatbot_api.py – no change needed except what we already did
 
-5️⃣ Next steps (after you paste this and it runs)
+You already have:
 
-Once this compiles and your API runs:
+```python
+from chatbot_agents.micro_llm import classify_contact_reply_small
+```
 
-We’ll create a tiny micro_llm.py with an actual cheap_llm_call() that talks to Ollama (or GPT-mini).
+and:
 
-We’ll replace the stub in llm_contact_reply_classifier with a real implementation.
+```python
+async def llm_contact_reply_classifier(offer_text: str, reply: str) -> str:
+    """
+    Delegate ambiguous reply classification to a small LLM
+    (Ollama or any cheap model via micro_llm).
+    """
+    try:
+        decision = await classify_contact_reply_small(offer_text, reply)
+        # safety: normalize unexpected outputs
+        if decision not in ("confirm", "decline", "other"):
+            return "other"
+        return decision
+    except Exception as e:
+        logger.warning("llm_contact_reply_classifier failed: %s", e)
+        return "other"
+```
 
-After that, we’ll move on to generate_exigotech_answer and then finally to prompt engineering.
+So **no further patch needed in this file** for the provider switching.
 
-If you run into any error after pasting these blocks (typo, indent, whatever), copy the traceback or the failing snippet and I’ll debug it with you.
+---
 
+## 4️⃣ How to switch providers in real life
 
+Now your life is easy:
 
+### Use **Ollama** (local, free)
+
+```env
+SMALL_LLM_PROVIDER=ollama
+USE_OLLAMA_CONTACT=true
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_CONTACT_MODEL=llama3.2:latest
+# OPENAI_API_KEY can be empty or unset
+```
+
+### Use **OpenAI GPT mini** (cloud, cheap)
+
+```env
+SMALL_LLM_PROVIDER=openai
+OPENAI_API_KEY=sk-xxx
+SMALL_LLM_MODEL=gpt-4.1-mini
+# USE_OLLAMA_CONTACT can be false or ignored
+```
+
+And if you ever want to switch back?
+Just flip `SMALL_LLM_PROVIDER` and restart your app.
+Zero code change.
+
+---
+
+If you want, next step we can:
+
+* Clean up `_extract_result_urls` to avoid leaking fake internal URLs,
+  **or**
+* Move on to reshaping `generate_exigotech_answer` to return a structured payload (`summary`, `services`, `primary_contact`) so contact + buttons become even cleaner.
+
+You pick the next target and I’ll keep doing small, surgical patches.
+Yeahhh okay, if you’re running **gpt-4.1-mini as the main model** and each conversation is hitting **50k tokens**, then using that *same* model as the “small helper” is like hiring a senior architect to press the elevator button. It works… but your wallet cries. 😅
+
+Let’s separate a few things clearly:
+
+---
+
+## 1️⃣ Using gpt-4.1-mini as MAIN = fine
+
+For your use case:
+
+* Final RAG answers
+* Complex, multi-page reasoning
+* Nicely worded explanations
+
+➡️ **gpt-4.1-mini is a solid choice.**
+No issues there.
+
+The problem is **how often** and **how much context** you feed it.
+
+If one conversation is hitting ~50k tokens, that usually means:
+
+* You’re sending **too much history** every time.
+* Prompts are fat.
+* Maybe you’re sending full chunks unnecessarily.
+* Multiple LLM calls per user turn.
+
+We’ve already started fixing the “too many calls” part with the architecture. Next we’ll trim context usage when we refactor `generate_exigotech_answer`.
+
+---
+
+## 2️⃣ For MICRO tasks → 4.1-mini is overkill
+
+Things like:
+
+* “Is this reply confirm / decline / other?”
+* “What’s the intent label: greeting / contact / service?”
+* “Does this need clarification?”
+
+These tasks:
+
+* Use tiny prompts (maybe 50–150 input tokens)
+* Can be handled by **any decent small model** (open-source or mini-GPT)
+
+So if you’re using **4.1-mini for these too**, you’re:
+
+* Adding extra latency
+* Paying LLM tax for trivial logic
+* Wasting potential
+
+That’s why I suggested the **two-tier** setup:
+
+* **MAIN_LLM_MODEL = gpt-4.1-mini** → only for final answers
+* **SMALL_LLM_PROVIDER = ollama** (or openai with SMALL_LLM_MODEL = gpt-4.1-mini, *only for very short prompts*)
+
+But honestly: if you can run **Ollama**, I’d push **all the micro-tasks** to it and keep 4.1-mini only for:
+
+* `generate_exigotech_answer`
+* Maybe `process_query_with_context` (if that’s also on Azure).
+
+---
+
+## 3️⃣ Where the 50k tokens probably come from
+
+Common sources:
+
+1. **Too much history sent each time**
+
+   * If you send entire conversation history + full chunks to the model on every turn → tokens explode.
+2. **Too many “nested” LLM calls** per user question:
+
+   * classify intent
+   * rewrite query
+   * re-classify refined query
+   * final answer
+3. **Big prompts full of instructions & examples** that never get trimmed.
+
+We’re already:
+
+* Reducing LLM calls by centralizing intent & context logic.
+* Separating micro-decisions (now handled by `micro_llm.py`).
+
+Next, when we refactor `generate_exigotech_answer`, we’ll:
+
+* Make sure it doesn’t receive unnecessary stuff.
+* Keep the history tight.
+* Avoid sending the same context over and over.
+
+That will cut your 50k down **hard**.
+
+---
+
+## 4️⃣ How to wire this cleanly in `.env`
+
+I’d do something like:
+
+```env
+# Main (big) LLM for RAG answers
+MAIN_LLM_PROVIDER=openai
+MAIN_LLM_MODEL=gpt-4.1-mini
+
+# Small LLM for classification, yes/no, cheap tasks
+SMALL_LLM_PROVIDER=ollama           # or 'openai' if you really want
+SMALL_LLM_MODEL=gpt-4.1-mini        # only used if SMALL_LLM_PROVIDER=openai
+
+# Ollama
+USE_OLLAMA_CONTACT=true
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_CONTACT_MODEL=llama3.2:latest
+```
+
+Then:
+
+* `exigotech_chatbot.py` uses `MAIN_LLM_MODEL` for answer generation.
+* `micro_llm.py` uses `SMALL_LLM_PROVIDER` and `SMALL_LLM_MODEL` for classification.
+
+You’ve already got the second part almost done. We’ll adjust the first part when we touch `generate_exigotech_answer`.
+
+---
+
+## 5️⃣ What I’d suggest next (to actually reduce that 50k)
+
+To *actually* start cutting tokens, next step is:
+
+**Refactor `generate_exigotech_answer` to:**
+
+* Return a structured payload:
+  `{"summary": ..., "services": [...], "primary_contact": {...}}`
+* Use **only the top-k shortest, most relevant chunks**, not everything.
+* Avoid re-sending huge history – just what’s needed.
+* Stop embedding JSON at the end of the answer (we handle structure in Python).
+
+That will:
+
+* Reduce tokens per call
+* Make answers cleaner
+* Make your Contact + “Relevant services” logic way more robust
+
+---
+
+If you’re up for it, I’d say:
+
+**Next move → we refactor `generate_exigotech_answer` together.**
+
+I’ll:
+
+* Show you a new version that fits the current API.
+* Keep it compatible with your existing prompts file (we’ll tune prompts last).
+* Make it return a dict, but you can still access `.summary` etc easily.
+
+If you’re ready, send me either:
+
+* the current `generate_exigotech_answer` function code, or
+* say: **“Use the last screenshots as truth, give me a fresh version of generate_exigotech_answer.”**
+
+And I’ll give you a clean, production-ready version you can paste in.
