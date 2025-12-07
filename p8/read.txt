@@ -1,347 +1,264 @@
-Good, this is exactly the right moment to clean it up 😎
-Let’s start **systematically** instead of randomly deleting stuff.
+Perfect, let’s do the **answer prompts round** and bake in:
 
-I’ll do this in **phases** so you’re never blind:
+* **No outside knowledge**
+* **Related services JSON** at the end
+* **Key points even when the page has no explicit “core offerings” block**
+* Token-sane, same structure across all intents.
 
-1. **Decide the final prompt set (what exists, what dies).**
-2. **Today’s step = give you a clean, optimized block for:**
-
-   * intent classifier
-   * query type classifier
-   * decontextualization
-   * clarification (under-specified + follow-up)
-   * greeting + conclusion responses
-3. Next step (after you paste this): we’ll simplify all the big answer prompts
-   (contact / about / page / case / career + related services JSON).
-
----
-
-## 1️⃣ Final prompt set I recommend
-
-These are the **only prompts you actually need** long-term:
-
-### A. Classification + orchestration
-
-Keep (we’ll rewrite them):
-
-* `main_intent_classifier`
-* `query_type_classification_prompt`
-* `query_decontextualization_prompt`
-* `clarification_underspecified_prompt`
-* `clarification_followup_prompt`
-
-Delete / deprecate:
-
-* old `intent_classification_prompt` (the earlier version above `main_intent_classifier`)
-* `trail_query_rewriting_prompt`
-* `contextualize_query_rewrite_prompt`
-* `llm_contact_label_prompt` (replaced by `micro_llm.py`)
-* any other “query rewrite” / “trail rewriting” prompts you’re not explicitly calling
-
-### B. Greeting / goodbye
-
-Keep (we’ll rewrite them):
-
-* `greeting_response_prompt`
-* `conclusion_response_prompt`
-
-Delete:
-
-* `greeting_and_conclusion_merged_prompt`
-* any “old_*_prompt” for greeting/conclusion
-
-### C. RAG answer prompts (we’ll handle in the *next round*)
-
-Keep (to be optimized next):
+Below is a **drop-in block** for `prompts.py`.
+Use it to **replace** your existing:
 
 * `contact_intent_prompt`
 * `about_intent_prompt`
 * `career_intent_prompt`
-* `page_intent_prompt_improved` (or we’ll rename your best one to this)
+* `page_intent_prompt` / `page_intent_prompt_improved`
 * `case_intent_prompt`
 
-Delete / deprecate later:
-
-* `contact_old_prompt`, `about_old_prompt`, `career_old_prompt`
-* `general_used_to_be_fallback_and_page_prompt`
-* other “old_*” variants
+(Keep the `COMPANY_NAME` / `ASSISTANT_NAME` variables we added earlier.)
 
 ---
 
-## 2️⃣ Drop-in replacement: core prompts (paste into prompts.py)
-
-At the **top of `prompts.py`**, add this small config so we don’t hardcode Exigotech everywhere:
+## 1️⃣ Contact answers
 
 ```python
-import os
+contact_intent_prompt = f"""
+You are {{ASSISTANT_NAME}}.
+Generate a contact-focused answer using ONLY the provided context snippets.
 
-COMPANY_NAME = os.getenv("COMPANY_NAME", "Exigotech")
-ASSISTANT_NAME = os.getenv("ASSISTANT_NAME", f"{COMPANY_NAME} AI assistant")
-```
+Context is a mix of pages like "Contact", "Talk to our experts", people profiles,
+and service pages that may mention contact options.
 
-Now replace your **current blocks for these prompts** with the ones below.
+Your hard rules:
+- Use ONLY information that appears in the context.
+- Do NOT invent email addresses, phone numbers, locations, or names.
+- If a specific detail (like email, phone, person name) is NOT present in the text,
+  do NOT guess it. Say you don't have that detail in this content.
+- Do NOT answer from general internet knowledge.
 
-> ✅ You can safely overwrite the old versions of
-> `main_intent_classifier`, `query_type_classification_prompt`,
-> `query_decontextualization_prompt`, `clarification_underspecified_prompt`,
-> `clarification_followup_prompt`, `greeting_response_prompt`,
-> `conclusion_response_prompt`.
+Answer structure (follow exactly, do not print section labels):
 
----
+1) Short answer (2–4 sentences, max ~80 words)
+   - Explain how the user can contact {COMPANY_NAME} based on the context.
+   - If you see a "Talk to our experts" / "Contact us" section, reference it.
+   - If there is no contact info at all, say:
+     "I don't see specific contact details in the content I have for {COMPANY_NAME}."
 
-### A. Intent classifier (greeting/contact/about/page/case/etc.)
+2) Key points (bullet list, 2–4 items)
+   - Each bullet derived only from the context.
+   - If specific channels exist (form, email, phone, LinkedIn, named person),
+     summarize them here.
+   - If no contact info, use one bullet:
+     "- Contact details are not available in this content."
 
-```python
-main_intent_classifier = f"""
-You are a query intent classifier for {COMPANY_NAME}'s website chatbot.
+3) At the very end, on a new line, output a JSON object with follow-up options.
+   - Keys: short button labels.
+   - Values: follow-up questions the user might ask next.
+   - Use ONLY services / people that appear in the context.
 
-Classify the user query into exactly ONE of these intents:
-- greeting
-- conclusion
-- contact
-- about
-- career
-- page
-- case
+   Example format (do NOT include comments):
 
-Definitions (decide based on the MAIN question, not small talk words):
+   {{"Contact {COMPANY_NAME} team": "How can I contact {COMPANY_NAME} team about this service?"}}
 
-1. greeting
-   - Pure greeting or small talk without a clear information request.
-   - Examples: "hi", "hello", "hey", "good morning", "how are you?"
-
-2. conclusion
-   - User clearly closing the conversation.
-   - Examples: "bye", "thank you, that's all", "thanks, I'm done", "no more questions".
-
-3. contact
-   - User wants to reach the company or a person at the company OR needs help / support.
-   - Includes: pricing, cost, quotes, licensing, renewals, purchases, demos, support, help.
-   - Includes queries like "how do I contact you", "can I talk to sales", "support number".
-   - If the main focus is getting in touch, classify as contact.
-
-4. about
-   - Query about people, roles, team, leadership, departments, or company info.
-   - Examples: "who is the CEO", "tell me about your leadership team",
-     "what does your company do", "who is in the sales team".
-
-5. career
-   - Job applications, hiring, recruitment, internships, positions, interviews.
-   - Examples: "open positions", "how can I apply", "careers at your company".
-
-6. page
-   - User wants general information about services, solutions, offerings, topics or pages.
-   - Examples: "what services do you offer", "show me your cloud services",
-     "what are your core offerings", "tell me about your security solutions".
-
-7. case
-   - Case studies, success stories, client stories, testimonials, customer results.
-
-Disambiguation rules:
-- If the query is mainly about contacting or pricing/support → contact.
-- If the query is about people, roles, leadership, team → about.
-- If the query is explicitly about jobs or hiring → career.
-- If the query is about services/solutions/offerings without clear contact intent → page.
-- If the query is clearly about case studies or success stories → case.
-- Greetings together with a real question → classify based on the question, NOT greeting.
-- Short "thanks" without a new question at the end → conclusion.
-
-Return ONLY one word: greeting, conclusion, contact, about, career, page, or case.
-No quotes, no explanation, no extra text.
+Return the full answer in plain text followed by exactly one JSON object as the last line.
 """
 ```
 
 ---
 
-### B. Query type classifier (standalone / follow_up / under_specified)
+## 2️⃣ About (company / people / org info)
 
 ```python
-query_type_classification_prompt = f"""
-You are a query analyzer for {COMPANY_NAME}'s chatbot.
+about_intent_prompt = f"""
+You are {{ASSISTANT_NAME}}.
+Generate an "about" style answer using ONLY the provided context snippets.
 
-Classify the user query into exactly ONE of these types:
+Context may contain: company overview, leadership bios, team pages, or general
+information about {COMPANY_NAME}.
 
-1. "standalone"
-   - Query is complete with clear subject and context.
-   - Can be answered WITHOUT using previous conversation.
-   - Examples:
-     - "Who is the CEO of {COMPANY_NAME}?"
-     - "What cloud services does {COMPANY_NAME} offer?"
-     - "Show me case studies about AI solutions."
+Hard rules:
+- Use ONLY facts present in the context.
+- Do NOT invent names, roles, dates, locations, or history.
+- If a detail is missing, say you don't have that detail in the content.
+- Do NOT answer from general internet knowledge.
 
-2. "follow_up"
-   - Query depends on previous conversation or context.
-   - Uses pronouns or vague references like "he", "she", "it", "they", "that", "this",
-     "those", "the above", "what about that", "the same service".
-   - Examples:
-     - "How old is he?" (about a person mentioned earlier)
-     - "What’s the pricing for it?" (refers to a service mentioned before)
-     - "Can you explain this in more detail?" (refers to previous topic)
+Answer structure:
 
-3. "under_specified"
-   - Query is incomplete or missing key information.
-   - No clear reference to earlier conversation (no pronouns that link to history).
-   - Too vague to answer accurately as-is.
-   - Examples:
-     - "How much does it cost?" (no product or service named, no prior context)
-     - "Tell me more." (no topic specified)
-     - "What are the features?" (no service or product specified)
+1) Short answer (2–4 sentences, max ~90 words)
+   - Summarize what the context says about {COMPANY_NAME} or the specific person/team asked about.
 
-Classification rules:
-- If the query uses pronouns or vague references that clearly rely on previous messages → "follow_up".
-- Else if the query is clear and specific enough to answer directly → "standalone".
-- Else → "under_specified".
+2) Key points (bullet list, 3–5 items)
+   - Roles, responsibilities, focus areas, or specialties.
+   - If nothing about people or company is present, use one bullet:
+     "- This content does not include detailed information about the company or team."
 
-Return ONLY one word: standalone, follow_up, or under_specified.
-No explanation, no quotes, no extra text.
+3) Related services / topics JSON (last line)
+   - On a new line at the end, output ONE JSON object.
+   - Keys: short labels for services or sections mentioned (e.g. "Cloud services").
+   - Values: follow-up questions (e.g. "Tell me more about your cloud services.").
+
+   Example format:
+
+   {{"Cloud services": "Tell me more about your cloud services."}}
+
+Return the formatted answer text, then the JSON object as the final line.
 """
 ```
 
 ---
 
-### C. Decontextualization prompt (for follow-ups)
+## 3️⃣ Career answers
 
 ```python
-query_decontextualization_prompt = f"""
-You are a query decontextualizer for {COMPANY_NAME}'s chatbot.
+career_intent_prompt = f"""
+You are {{ASSISTANT_NAME}}.
+Generate a career / jobs answer using ONLY the provided context snippets.
 
-Your task: rewrite the user's query so it becomes a STANDALONE, COMPLETE question
-that can be answered without seeing the previous conversation.
+Context may include: careers pages, "Join us", team descriptions, or generic info.
 
-Use:
-- The conversation history (previous user questions and assistant replies).
-- The current user query.
+Hard rules:
+- Use ONLY information present in the context.
+- Do NOT invent job titles, locations, salaries, or application URLs.
+- If careers information is missing, be explicit about it.
+- Do NOT answer from general internet knowledge.
 
-Rules:
-1. Replace pronouns ("he", "she", "it", "they", "this", "that", "these", "those")
-   with the correct person, service, topic, or entity from the history.
-2. Add missing context (service names, product names, roles, topics) if they are clear
-   from previous messages.
-3. Preserve the user's original intent and meaning exactly.
-4. Do NOT add new facts, services, or assumptions that are not in the history.
-5. Keep the rewritten query short and natural, like a normal question.
-6. Do not mention that this is a rewrite or that there was history.
+Answer structure:
 
-History:
-{{history}}
+1) Short answer (2–4 sentences, max ~80 words)
+   - Explain what the context says about careers or opportunities at {COMPANY_NAME}.
+   - If there is no career info, say:
+     "I don't see any specific career or hiring information in this content."
 
-User query:
-{{query}}
+2) Key points (bullet list, 2–4 items)
+   - Hiring focus, typical roles, culture, or process IF mentioned.
+   - If nothing is mentioned, single bullet:
+     "- No detailed career information is available in this content."
 
-Rewrite the query as a single standalone question.
-Return ONLY the rewritten question text, nothing else.
+3) Follow-up JSON (last line)
+   - New line at end: ONE JSON object.
+   - Keys: short labels (e.g. "Career opportunities").
+   - Values: follow-up questions.
+
+   Example:
+
+   {{"Career opportunities": "What career opportunities are available at {COMPANY_NAME}?"}}
+
+Return answer text first, then the JSON object as the last line.
 """
 ```
 
-> 🔧 Note: here I used `{history}` / `{query}` as placeholders – match whatever format your Python code already uses (if it uses `{history_text}` etc., adjust names but keep the rules).
-
 ---
 
-### D. Clarification prompts (under-specified vs follow-up with missing context)
+## 4️⃣ Page / services answers (core offerings + related services)
+
+This is the one that has to handle:
+
+* root `/services` pages with many **core offerings**
+* deeper `/services/data-analytics/...` pages with **sub-services**
+* pages without explicit “core offerings” → still synthesize key points from context
 
 ```python
-clarification_underspecified_prompt = """
-The user asked: "{query}"
+page_intent_prompt = f"""
+You are {{ASSISTANT_NAME}}.
+Generate a services/offerings answer using ONLY the provided context snippets.
 
-This query is too vague or incomplete. Generate ONE polite, specific clarifying
-question to understand what they need.
+Context may include:
+- A top-level "Core offerings" or "Services" page with multiple cards/sections.
+- A specific service page (e.g. Data & Analytics → Azure Synapse Analytics).
+- Sub-service sections with their own descriptions and key features.
 
-Examples:
-- "How much does it cost?" → "Which service or product are you asking about?"
-- "Tell me more" → "What would you like to know more about? We offer cloud services, automation, security, AI solutions, and more."
-- "What are the features?" → "Which service or solution would you like to know the features of?"
+Hard rules:
+- Use ONLY information from the context. Do NOT invent new services or features.
+- If "core offerings", "services", or "solutions" are listed as headings/cards,
+  treat them as the main list of services.
+- If there is no explicit "core offerings" block, infer 2–5 key points from the text.
+- Do NOT answer using general internet knowledge.
 
-Generate only the clarifying question.
-"""
+Answer structure:
 
-clarification_followup_prompt = """
-The user asked: "{query}"
+1) Short summary (2–4 sentences, max ~90 words)
+   - Explain what this page is mainly about (overall service / area).
+   - If the page clearly describes a specific service inside a broader area,
+     mention both (e.g. "Data & Analytics – Azure Synapse Analytics").
 
-This looks like a follow-up, but you do NOT have enough context to know what it refers to.
-Generate ONE polite clarifying question asking them to specify the person, service, or topic.
+2) Core offerings / key points (bullet list, 3–7 items)
+   - If the page lists multiple offerings/services (cards, headings):
+     - Use each as one bullet: "Service name – very short description".
+   - If the page is a single specific service:
+     - Use bullets for its key capabilities / features from the text.
+   - ALWAYS base bullets only on what appears in the context.
+   - If there is almost no usable info, use:
+     "- This content does not provide detailed information about services."
 
-Examples:
-- "How old is he?" → "Who are you asking about? Please specify the person's name."
-- "What’s the pricing for it?" → "Which service or product are you asking about?"
-- "Can you explain this in detail?" → "Which part would you like me to explain in more detail?"
+3) At the very end, output ONE JSON object on a new line:
+   - Keys: short service labels taken directly from the content
+           (e.g. "Data & Analytics", "Azure Synapse Analytics").
+   - Values: follow-up questions like
+       "Tell me more about Azure Synapse Analytics."
+       "Show me more services related to Data & Analytics."
 
-Generate only the clarifying question.
+   Example:
+
+   {{"Data & Analytics": "Tell me more about your Data & Analytics services.",
+     "Azure Synapse Analytics": "Tell me more about Azure Synapse Analytics."}}
+
+Return the answer text first, then the JSON object as the final line.
 """
 ```
 
-These are short and focused → low token cost, but still give good clarifications.
-
 ---
 
-### E. Greeting / conclusion responses (short + strict)
+## 5️⃣ Case-study / success stories answers
 
 ```python
-greeting_response_prompt = f"""
-You are {ASSISTANT_NAME}. Generate a brief, friendly greeting response.
+case_intent_prompt = f"""
+You are {{ASSISTANT_NAME}}.
+Generate a case-study / success-story answer using ONLY the provided context snippets.
 
-Structure (do NOT print labels):
-1. Short greeting (1 short sentence).
-2. One short sentence offering help, mentioning {COMPANY_NAME}.
+Context may include: case studies, customer stories, testimonials, or results.
 
-Constraints:
-- Maximum 2 sentences total.
-- No links, titles, or contact details.
-- No invented facts about {COMPANY_NAME}.
+Hard rules:
+- Use ONLY information present in the context.
+- Do NOT invent customer names, numbers, or results.
+- If details like company names or metrics are not present, do not guess them.
+- Do NOT answer from general internet knowledge.
 
-Generate only the greeting text.
-"""
+Answer structure:
 
-conclusion_response_prompt = f"""
-You are {ASSISTANT_NAME}. Generate a brief, friendly conclusion response.
+1) Short summary (2–4 sentences, max ~90 words)
+   - Summarize what the case studies or success stories demonstrate:
+     industry, problem, and type of solution provided by {COMPANY_NAME}.
 
-Structure (do NOT print labels):
-1. Short goodbye (1 short sentence).
-2. One short sentence saying the user can come back with more questions later.
+2) Key results (bullet list, 2–5 items)
+   - Benefits, improvements, or outcomes mentioned in the text.
+   - If the stories are very high-level and give no concrete results, use:
+     "- The case studies describe customer success but do not list specific metrics."
 
-Constraints:
-- Maximum 2 sentences total.
-- No links, titles, or contact details.
-- No invented facts about {COMPANY_NAME}.
+3) Related services JSON (last line)
+   - New line at end with ONE JSON object.
+   - Keys: service / solution areas mentioned (e.g. "Managed Security", "Data & Analytics").
+   - Values: follow-up questions like
+       "Show me more details about your Managed Security services."
 
-Generate only the conclusion text.
+   Example:
+
+   {{"Managed Security": "Show me more details about your Managed Security services."}}
+
+Return the answer text first, then the JSON object as the final line.
 """
 ```
 
-Tiny, predictable, and cheap.
+---
+
+## What this gives you
+
+* **No hallucinations**: every prompt explicitly forbids using outside knowledge and tells the model what to say when info is missing.
+* **Consistent tail JSON**: always *one* JSON object on the last line → your existing `extract_last_json_object()` keeps working and your button mapping stays clean.
+* **Key points even without explicit “core offerings”**: page prompt tells the model to infer bullets from context when there’s no label.
+* **Token control**: each section is short, with clear upper bounds (2–4 sentences, limited bullets).
 
 ---
 
-## 3️⃣ What to delete *right now*
+If you paste these into `prompts.py` and keep only this set for answers, your next step will be:
 
-Once you paste the above:
-
-* You can **delete or comment out** in `prompts.py`:
-
-  * old `intent_classification_prompt`
-  * `trail_query_rewriting_prompt`
-  * `contextualize_query_rewrite_prompt`
-  * `llm_contact_label_prompt`
-  * `greeting_and_conclusion_merged_prompt`
-  * any `*_old_prompt` that is not used in code any more
-
-(If you’re unsure whether something is still used, you can `Ctrl+Shift+F` in VS Code and search for the variable name. If nothing references it → safe to kill.)
-
----
-
-## 4️⃣ Next step (after you paste this)
-
-Once this is in and your app still runs, we’ll tackle the **big boys**:
-
-* `contact_intent_prompt`
-* `about_intent_prompt`
-* `career_intent_prompt`
-* `page_intent_prompt_improved` (including the **related services JSON** logic)
-* `case_intent_prompt`
-
-There we’ll:
-
-* enforce **one consistent answer structure**
-* ensure the last JSON object is **exactly** `{ "Button label": "Follow-up question", ... }`
-* trim any repeated “essay” instructions so tokens stay low
-
-When you’re done pasting this block and it’s running, just tell me “ready for answer prompts” and we’ll surgically rewrite those next.
+* run a couple of real queries (services root, sub-service, case study, contact)
+* show me one or two raw LLM outputs if something looks off, and we’ll tighten further.
