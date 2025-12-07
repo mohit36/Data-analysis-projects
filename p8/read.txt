@@ -1,316 +1,633 @@
-Nice, respect for actually wiring it the way we discussed 🙌
-Since search_internal_answers_async is now in the right shape, next step is:
+# chatbot_api.py  (cleaned + contact-button strategy)
 
-Plug it into agent_search_async and add a clean merge + single rerank.
+import asyncio
+from contextlib import asynccontextmanager
+import json
+import os
+import time
+import uuid
+from functools import lru_cache
+from typing import Any, Dict, Optional, Tuple, List, Set
 
-Let’s do that in 2 small, focused moves.
+from dotenv import load_dotenv
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel
+import httpx
+from starlette.middleware.base import BaseHTTPMiddleware
 
-1️⃣ Add a helper to merge + dedup candidates
+from pgvector_helper.session_memory_pgvector import (
+    save_message,
+    get_recent_history,
+    get_msg_count,
+)
+from chatbot_agents.chatbot_search_new import (
+    contextualize_query,   # imported for completeness (used inside hybrid_query_search)
+    hybrid_query_search,
+    SearchAgent,
+)
+from api_handler.rate_limit_middleware import add_rate_limit_middleware
+from pgvector_helper.db_logger import get_db_logger
+from chatbot_agents.exigotech_chatbot import generate_exigotech_answer
 
-Put this somewhere below SearchAgent in chatbot_search_new.py (or as a @staticmethod inside the class if you prefer).
+# -------------------------------------------------------------------
+# Env + logger
+# -------------------------------------------------------------------
 
-from typing import Any, Dict, List
+load_dotenv()
+logger = get_db_logger(__name__)
 
-def merge_and_dedup_candidates(*result_lists: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Merge candidates from multiple sources and deduplicate by URL or internal id.
-
-    Expected fields:
-      - url (for website chunks) OR
-      - id + source_type == "internal" (for internal answers)
-    """
-
-    all_results: List[Dict[str, Any]] = []
-    for lst in result_lists:
-        if lst:
-            all_results.extend(lst)
-
-    if not all_results:
-        return []
-
-    dedup: Dict[str, Dict[str, Any]] = {}
-
-    for r in all_results:
-        # Website chunks have a real URL
-        if r.get("url"):
-            key = r["url"]
-        else:
-            # Internal answers: use DB id or question as stable key
-            internal_id = r.get("id") or r.get("page_title") or r.get("question")
-            key = f"internal://{internal_id}"
-
-        score = float(r.get("score", 0.0))
-
-        # Keep the highest-scoring candidate per key
-        if key not in dedup or score > dedup[key].get("score", 0.0):
-            dedup[key] = r
-
-    # Sort by vector score before cross-encoder rerank (optional but nice)
-    return sorted(dedup.values(), key=lambda x: x.get("score", 0.0), reverse=True)
+# -------------------------------------------------------------------
+# FastAPI app + lifespan (shared httpx client)
+# -------------------------------------------------------------------
 
 
-This assumes exactly what you now return from:
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Create shared httpx.AsyncClient and close it on shutdown."""
+    boot_start = time.perf_counter()
+    logger.info("chatbot_api lifespan starting", extra={"service": "api"})
 
-async_search_local_pgvector (website)
+    # Startup
+    t0 = time.perf_counter()
+    app.state.http_client = httpx.AsyncClient(
+        limits=httpx.Limits(max_keepalive_connections=20, max_connections=200),
+        timeout=httpx.Timeout(30.0),
+    )
+    logger.info(
+        "httpx client created in %.3f seconds",
+        time.perf_counter() - t0,
+        extra={"service": "api"},
+    )
 
-search_internal_answers_async (internal)
+    logger.info(
+        "FastAPI boot time: %.3f seconds",
+        time.perf_counter() - boot_start,
+        extra={"service": "api"},
+    )
 
-2️⃣ Update agent_search_async to use website + internal + rerank
-
-Now replace the body of SearchAgent.agent_search_async with this version.
-
-Don’t touch the signature; just replace inside the function.
-
-class SearchAgent:
-    def __init__(self, collection_name=None, intent=None):
-        # Initialize the agent with a default collection name and other configurations
-        self.collection_name = collection_name or PGTABLE_BASE
-        self.intent = intent
-        self.client_conn = get_pgvector_client()  # Assuming this connects to a database or vector store
-        register_vector(self.client_conn)         # Assuming this registers the vector-based client
-
-    async def classify_query_type(self, query):
+    try:
+        # Application runs here
+        yield
+    finally:
+        # Shutdown
+        logger.info("Starting graceful shutdown...", extra={"service": "api"})
+        t1 = time.perf_counter()
         try:
-            llm_result = await llm_intent(query)
-            self.intent = llm_result
-            return llm_result
+            await app.state.http_client.aclose()
+            logger.info(
+                "httpx client closed in %.3f seconds",
+                time.perf_counter() - t1,
+                extra={"service": "api"},
+            )
+        except AttributeError as e:
+            logger.error(
+                "httpx client attribute error during shutdown: %s",
+                e,
+                extra={"service": "api"},
+            )
         except Exception as e:
-            logger.error(f"Intent classification failed: {e}")
-            return "page"  # Default fallback
+            logger.error(
+                "httpx client close failed: %s",
+                e,
+                extra={"service": "api"},
+            )
+        logger.info("Shutdown complete", extra={"service": "api"})
 
-    async def agent_search_async(self, query, top_k=10, request_url=None, country_code=None):
-        """
-        Search with intent classification, website search, internal answers search,
-        and a single global rerank.
-        """
 
-        # 1. Get intent and map to primary source types
-        intent = await self.classify_query_type(query)
-        logger.info(f"🧠 Query intent: {intent}")
+app = FastAPI(lifespan=lifespan)
 
-        intent_to_source_type = {
-            "case": "case",
-            "greeting": None,
-            "conclusion": None,
-            "contact": "contact",
-            "about": "about",
-            "career": "career",
-            "page": "page",
+# -------------------------------------------------------------------
+# Constants / config
+# -------------------------------------------------------------------
+
+SESSION_COOKIE_NAME = "session_id"
+HISTORY_MAXLEN = 10  # 5 user+assistant pairs
+
+RATE_LIMIT = int(os.getenv("API_REQUEST_LIMIT", 1))
+RATE_WINDOW = 60
+
+RAW_ANSWER_MAX_LEN = 2000
+CODE_BLOCK_MAX_LINES = 20
+REDACT_TOKEN = "[REDACTED]"
+
+# -------------------------------------------------------------------
+# Session middleware (cookie + header)
+# -------------------------------------------------------------------
+
+
+class SessionMiddleware:
+    """Marker class to keep old imports working."""
+    pass
+
+
+class _SessionMiddlewareImpl(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Try to read existing session id
+        sid = request.cookies.get(SESSION_COOKIE_NAME)
+
+        new_sid = False
+        if not sid:
+            sid = _generate_session_id()
+            new_sid = True
+
+        # Attach to request state
+        request.state.session_id = sid
+
+        # Call downstream
+        response: Response = await call_next(request)
+
+        # Set cookie if new
+        if new_sid:
+            response.set_cookie(
+                key=SESSION_COOKIE_NAME,
+                value=sid,
+                httponly=True,
+                secure=True,   # in production ensure HTTPS
+                samesite="Lax",
+                path="/",
+                max_age=60 * 60 * 24,
+            )
+
+        # Always expose session id header for debugging
+        response.headers["X-Session-ID"] = sid
+        return response
+
+
+def _generate_session_id() -> str:
+    return str(uuid.uuid4())
+
+
+app.add_middleware(_SessionMiddlewareImpl)
+add_rate_limit_middleware(app)
+
+# -------------------------------------------------------------------
+# Request models
+# -------------------------------------------------------------------
+
+
+class SummarizeRequest(BaseModel):
+    query: str
+
+
+# -------------------------------------------------------------------
+# Geo helpers
+# -------------------------------------------------------------------
+
+
+@lru_cache(maxsize=1000)
+def get_client_ip(request: Request) -> Tuple[str, Optional[str]]:
+    """
+    Returns (client_ip, override_country_from_header).
+    Uses X-Forwarded-For and X-Geo-Country if present.
+    """
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        client_ip = xff.split(",")[0].strip()
+    else:
+        client_ip = request.client.host if request.client else "unknown"
+
+    override_country = request.headers.get("x-geo-country")
+    override_country = override_country.strip().lower() if override_country else None
+    return client_ip, override_country
+
+
+async def get_country_code(ip: str, client: httpx.AsyncClient) -> Optional[str]:
+    """Basic IP → country lookup. Returns lowercased code or None."""
+    if not ip or ip in ("unknown", "127.0.0.1", "::1"):
+        return None
+
+    try:
+        r = await client.get(f"https://ipapi.co/{ip}/json/")
+        r.raise_for_status()
+        data = r.json()
+        code = data.get("country")
+        return code.lower() if code else None
+    except Exception as e:
+        logger.warning("Country code lookup failed for IP=%s: %s", ip, e)
+        return None
+
+
+# -------------------------------------------------------------------
+# Mapping + state (for button → follow-up question)
+# -------------------------------------------------------------------
+
+# Per-session store for mapped questions / business intent counters, etc.
+service_mapping_store: Dict[str, Dict[str, Any]] = {}
+
+
+def get_session_state(sid: str) -> Dict[str, Any]:
+    """Get or create session-scoped state dict."""
+    return service_mapping_store.setdefault(sid, {})
+
+
+# -------------------------------------------------------------------
+# History helpers (DB-backed)
+# -------------------------------------------------------------------
+
+
+async def get_history_snapshot(sid: str) -> List[Dict[str, Any]]:
+    """
+    Return recent chat history for a session from Postgres.
+    Keeps the old signature so existing calls still work.
+    """
+    if not sid:
+        return []
+    return await get_recent_history(sid, limit=HISTORY_MAXLEN)
+
+
+async def push_user(sid: str, query: str) -> None:
+    """Store the user message in Postgres."""
+    if not sid or not query:
+        return
+    await save_message(sid, "user", query)
+
+
+async def push_assistant_sanitized(
+    sid: str,
+    sanitized_text: str,
+    parsed_json: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Store the assistant message in Postgres (only visible text).
+
+    Any parsed_json used for buttons/contact is handled separately
+    and returned to the frontend.
+    """
+    if not sid or not sanitized_text:
+        return
+    await save_message(sid, "assistant", sanitized_text)
+
+
+# -------------------------------------------------------------------
+# JSON helpers
+# -------------------------------------------------------------------
+
+
+def extract_last_json_object(text: str) -> Optional[Dict[str, str]]:
+    """
+    Extract the last JSON object from the string (if any) and return it
+    as Dict[str, str]. Used for the 'relevant services' / buttons JSON.
+    """
+    if not text:
+        return None
+
+    s = text.strip()
+    end = s.rfind("}")
+    if end == -1:
+        return None
+
+    stack = 0
+    start = -1
+    for i in range(end, -1, -1):
+        c = s[i]
+        if c == "}":
+            stack += 1
+        elif c == "{":
+            stack -= 1
+            if stack == 0:
+                start = i
+                break
+
+    if start == -1:
+        return None
+
+    candidate = s[start : end + 1]
+    try:
+        parsed = json.loads(candidate)
+        if isinstance(parsed, dict):
+            # ensure all keys/values are strings
+            return {str(k): str(v) for k, v in parsed.items()}
+    except Exception:
+        return None
+
+    return None
+
+
+# -------------------------------------------------------------------
+# Matching helpers for mapped questions
+# -------------------------------------------------------------------
+
+
+def norm(s: str) -> str:
+    return " ".join(s.lower().strip().split())
+
+
+def lookup_mapped_question(
+    sid: str,
+    user_query: str,
+) -> Optional[str]:
+    """
+    Given the user's raw query and session id, try to map it to an existing
+    button label (from previous 'relevant services' JSON) and return the
+    underlying follow-up question. Returns None if no mapping.
+    """
+    if not sid or not user_query:
+        return None
+
+    mapping = service_mapping_store.get(sid) or {}
+    if not mapping:
+        return None
+
+    nq = norm(user_query)
+
+    # Exact match
+    for k, v in mapping.items():
+        if norm(k) == nq:
+            return v
+
+    # Soft match: query contained in key or vice versa
+    for k, v in mapping.items():
+        nk = norm(k)
+        if nq in nk or nk in nq:
+            return v
+
+    return None
+
+
+def _extract_result_urls(results: List[Dict[str, Any]]) -> Set[str]:
+    """
+    Collect distinct URLs from search results.
+    """
+    urls: Set[str] = set()
+    for item in results or []:
+        if isinstance(item, str):
+            urls.add(item)
+        elif isinstance(item, dict) and "url" in item:
+            urls.add(str(item["url"]))
+        elif hasattr(item, "url"):
+            try:
+                urls.add(getattr(item, "url"))
+            except Exception:
+                pass
+    return urls
+
+
+# -------------------------------------------------------------------
+# Endpoints
+# -------------------------------------------------------------------
+
+
+@app.get("/")
+async def root():
+    return {
+        "message": "Exigotech Chatbot API is running. Use POST /summarize with {'query': 'your question'}",
+    }
+
+
+# -------------------------------------------------------------------
+# Main RAG endpoint
+# -------------------------------------------------------------------
+
+
+@app.post("/summarize")
+async def summarize(
+    payload: SummarizeRequest,
+    request: Request,
+) -> Dict[str, Any]:
+    """
+    Main chatbot endpoint.
+
+    Flow:
+    - Validate query
+    - Resolve / create session id
+    - Map query via previous buttons (service_mapping_store) if applicable
+    - Determine country (headers/IP)
+    - Classify intent (SearchAgent)
+        * For greeting / conclusion → direct LLM answer (no RAG)
+        * Else → full RAG pipeline with hybrid_query_search
+    - hybrid_query_search handles:
+        * context-aware rewriting
+        * history relevance
+        * clarification if under-specified
+    - If clarification needed → return clarification only
+    - Else → generate_exigotech_answer on top-k results
+    - Extract 'relevant services' JSON from answer
+    - Optionally inject one extra "Contact about X" button into that JSON
+    - Persist user + answer + update mapping_store
+    - Return text + useful links + mapped_questions JSON
+    """
+    try:
+        # 0) Basic validation
+        query = (payload.query or "").strip()
+        if not query:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "query is required"},
+            )
+
+        # 1) Session handling
+        sid = getattr(request.state, "session_id", None)
+        if not sid:
+            sid = _generate_session_id()
+            logger.warning(
+                "No session_id found on request.state; generated fallback sid=%s",
+                sid,
+                extra={"service": "api"},
+            )
+
+        # 2) DB-based counters (used for potential business heuristics)
+        msg_count = await get_msg_count(sid)
+        state = get_session_state(sid)
+        business_count = int(state.get("business_count", 0))
+
+        # 3) Lookup mapped question (from previous related-services buttons)
+        mapped_question = lookup_mapped_question(sid, query)
+        if mapped_question:
+            logger.info(
+                "Mapped user query '%s' -> '%s' based on previous buttons",
+                query,
+                mapped_question,
+                extra={"service": "api"},
+            )
+            query = mapped_question
+
+        # 4) IP / geo info
+        client_ip, header_country = get_client_ip(request)
+        test_country = request.headers.get("X-Country-Override")
+        override_country = header_country
+        http_client: Optional[httpx.AsyncClient] = getattr(
+            request.app.state, "http_client", None
+        )
+
+        country_code: Optional[str] = None
+        if test_country:
+            country_code = test_country.lower()
+        elif override_country:
+            country_code = override_country.lower()
+        elif http_client is not None:
+            country_code = await get_country_code(client_ip, http_client)
+
+        # 5) First-pass intent classification
+        agent = SearchAgent()
+        query_intent = await agent.classify_query_type(query)
+
+        # Track business-oriented queries (for future heuristics)
+        business_intents = {
+            "service",
+            "contact",
+            "sales",
+            "pricing",
+            "buy",
+            "business",
+            "quote",
+            "demo",
+            "what",
         }
-        primary_source_type = intent_to_source_type.get(intent, "page")
 
-        # 2. Resolve table by URL/country (SG/PH vs AU etc.)
-        final_table = get_collection_by_url(
-            request_url=request_url,
-            base_collection=self.collection_name,
+        if isinstance(query_intent, str) and query_intent.lower() in business_intents:
+            business_count += 1
+            state["business_count"] = business_count
+
+        # 6) Greeting / conclusion short-circuit (no RAG)
+        if isinstance(query_intent, str) and query_intent.lower() in (
+            "greeting",
+            "conclusion",
+        ):
+            raw_answer = await generate_exigotech_answer(
+                chunks=[],
+                query=query,
+                links=None,
+                intent=query_intent,
+            )
+
+            await push_user(sid, query)
+            await push_assistant_sanitized(sid, raw_answer)
+
+            return {
+                "summary": raw_answer,
+                "useful_links": [],
+                "mapped_questions": {},
+                "needs_clarification": False,
+            }
+
+        # 7) Normal RAG / search flow with context-aware processing
+        session_history_snapshot = await get_history_snapshot(sid)
+
+        processed_query, results, search_metadata = await hybrid_query_search(
+            query=query,
+            history=session_history_snapshot,
+            top_k=10,
+            request_url=str(request.url),
             country_code=country_code,
         )
 
-        if not final_table:
-            logger.error(f"❌ No matching collection (url={request_url}, cc={country_code})")
-            raise RuntimeError("No matching regional collection available")
+        # 7a) Clarification needed
+        if search_metadata.get("needs_clarification"):
+            clarification = search_metadata.get("clarification_question") or (
+                "Could you please clarify your question?"
+            )
 
-        # 3. Embed query once
-        query_vector = model.encode([query])[0].tolist()
+            # Persist user + clarification
+            await push_user(sid, query)
+            await push_assistant_sanitized(sid, clarification)
 
-        # Oversample for reranking
-        top_k_primary = max(top_k * 3, 30)
-        top_k_internal = max(top_k, 10)
+            return {
+                "summary": clarification,
+                "useful_links": [],
+                "mapped_questions": {},
+                "needs_clarification": True,
+            }
 
-        # 4. Kick off website + internal search in parallel
-        primary_task = async_search_local_pgvector(
-            self.client_conn,
-            query_vector=query_vector,
-            top_k=top_k_primary,
-            source_type=primary_source_type,
-            collection_name=final_table,
-            query_text=query,
-            use_reranking=False,  # retrieval only; rerank later
+        # 7b) No results case
+        if not results:
+            no_results_msg = (
+                "No results found for your query. Please try rephrasing "
+                "or ask another question."
+            )
+            await push_user(sid, query)
+            await push_assistant_sanitized(sid, no_results_msg)
+
+            return {
+                "summary": no_results_msg,
+                "useful_links": [],
+                "mapped_questions": {},
+                "needs_clarification": False,
+            }
+
+        # Optionally re-classify intent on refined query
+        refined_intent = await agent.classify_query_type(processed_query)
+        if refined_intent:
+            query_intent = refined_intent
+
+        # 8) Generate Exigotech answer (LLM) from search results
+        raw_answer = await generate_exigotech_answer(
+            chunks=results[:5],
+            query=processed_query,
+            links=None,
+            intent=query_intent,
         )
 
-        internal_task = search_internal_answers_async(
-            self.client_conn,
-            query_text=query,
-            query_vector=query_vector,
-            top_k=top_k_internal,
-            use_reranking=False,  # same idea: retrieval only
+        # 9) Parse 'relevant services' JSON from the answer
+        parsed_json = extract_last_json_object(raw_answer)
+
+        # 10) Optional contact-button injection (still just label -> question)
+        if isinstance(parsed_json, dict):
+            lowered_query = (processed_query or "").lower()
+            business_keywords = (
+                "price",
+                "pricing",
+                "license",
+                "licence",
+                "quote",
+                "demo",
+                "cost",
+                "sales",
+                "buy",
+            )
+            is_business_like = any(k in lowered_query for k in business_keywords)
+
+            intent_str = (
+                query_intent.lower()
+                if isinstance(query_intent, str)
+                else ""
+            )
+
+            should_inject_contact = is_business_like or intent_str in ("contact",)
+
+            if should_inject_contact and "contact" not in parsed_json:
+                # Try to grab a main service name from existing buttons
+                service_names = list(parsed_json.keys())
+                if service_names:
+                    main_service = service_names[0]
+                else:
+                    main_service = (
+                        processed_query[:80]
+                        if processed_query
+                        else "Exigotech services"
+                    )
+
+                contact_label = f"Contact about {main_service}"
+                contact_question = (
+                    f"How can I contact Exigotech sales team about {main_service}?"
+                )
+
+                parsed_json[contact_label] = contact_question
+
+        # 11) Persist user + assistant + update mapping_store
+        await push_user(sid, query)
+        await push_assistant_sanitized(sid, raw_answer, parsed_json=parsed_json)
+
+        if isinstance(parsed_json, dict) and parsed_json:
+            mapping = service_mapping_store.setdefault(sid, {})
+            for label, followup in parsed_json.items():
+                if isinstance(label, str) and isinstance(followup, str):
+                    mapping[label] = followup
+
+        # 12) Extract useful links from results
+        result_urls = _extract_result_urls(results)
+        useful_links = list(result_urls)[:5]
+
+        return {
+            "summary": raw_answer,
+            "useful_links": useful_links,
+            "mapped_questions": parsed_json or {},
+            "needs_clarification": False,
+        }
+
+    except Exception as e:
+        logger.exception("summarize failed: %s", e)
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Internal error"},
         )
-
-        primary_results, internal_results = await asyncio.gather(
-            primary_task,
-            internal_task,
-        )
-
-        logger.info(
-            f"🔎 Retrieved candidates: website={len(primary_results)}, "
-            f"internal={len(internal_results)}"
-        )
-
-        # 5. Merge + dedup candidates
-        candidates = merge_and_dedup_candidates(primary_results, internal_results)
-
-        if not candidates:
-            logger.warning("⚠️ No candidates from website or internal answers")
-            return []
-
-        # 6. Single global rerank with cross-encoder
-        reranked_results, quality = await rerank_results_with_cross_encoder(
-            query=query,
-            results=candidates,
-            top_k=top_k,
-        )
-
-        logger.info(f"🏁 Final rerank quality: {quality}, returned={len(reranked_results)}")
-
-        return reranked_results
-
-What this gives you right now
-
-✅ Website search (filtered by source_type from intent)
-
-✅ Internal answers search (your cached Q/A DB)
-
-✅ Both run in parallel using asyncio.gather
-
-✅ Results are merged + deduped
-
-✅ One global rerank for all candidates
-
-No general (no-source_type) search yet — we can add that in the next step once this is working and tested.
-
-3️⃣ What to do after this compiles
-
-Run a few manual tests in your API:
-
-Normal website-only query (e.g. “cloud security services”).
-
-Pure internal answer query (something you put in cached_question_answer).
-
-A query that could match both.
-
-Check logs for:
-
-Retrieved candidates: website=X, internal=Y
-
-Final rerank quality: ...
-
-If that all looks sane and you’re not hitting any key errors, we’re ready for the next enhancement:
-
-Add general (no-source_type) website search as a third parallel task
-and include it in merge_and_dedup_candidates → reranker.
-
-When you’re done implementing this step, tell me:
-
-“Done, add general search now”
-
-and I’ll show you the minimal changes (one more task + one more argument into merge_and_dedup_candidates).
-
-
-
-
-Nice, this is a clean piece to add.
-Let’s set up your internal cached Q/A table in Postgres with pgvector + HNSW using cosine distance (matching your query).
-
-I’ll give you:
-
-CREATE EXTENSION (pgvector)
-
-CREATE TABLE cached_question_answer
-
-HNSW index for cosine distance
-
-Optional tuning tips
-
-The HNSW syntax is straight from the official pgvector docs. 
-GitHub
-+1
-
-1️⃣ Enable pgvector (once per database)
-
-Run this in your DB (as superuser / migration):
-
-CREATE EXTENSION IF NOT EXISTS vector;
-
-2️⃣ Create the internal answers table
-
-You’re using thenlper/gte-large as the embedding model, which is 1024-dimensional.
-If you ever switch models, adjust the 1024 accordingly.
-
-CREATE TABLE cached_question_answer (
-    id           bigserial PRIMARY KEY,
-    question     text        NOT NULL,
-    answer_text  text        NOT NULL,
-    frequency    integer     NOT NULL DEFAULT 0,
-    embedding    vector(1024) NOT NULL  -- adjust dim if your model is different
-);
-
-
-frequency → how often this Q/A is used (for analytics / ordering)
-
-embedding → the vector for question (or question+context)
-
-This matches how pgvector expects the vector type to be created. 
-GitHub
-
-3️⃣ Create HNSW index for cosine distance
-
-You’re already querying with:
-
-ORDER BY embedding <=> %s::vector
-
-
-and comments say “cosine distance”, so we use vector_cosine_ops in the index. 
-GitHub
-+1
-
-CREATE INDEX cached_question_answer_embedding_hnsw_idx
-ON cached_question_answer
-USING hnsw (embedding vector_cosine_ops);
-
-
-If you want explicit params (optional, defaults are usually fine):
-
-CREATE INDEX cached_question_answer_embedding_hnsw_idx
-ON cached_question_answer
-USING hnsw (embedding vector_cosine_ops)
-WITH (m = 16, ef_construction = 64);
-
-4️⃣ Basic query pattern (what your Python is doing)
-
-This is basically what your function runs:
-
-SELECT
-    id,
-    question,
-    answer_text,
-    frequency,
-    1 - (embedding <=> $1::vector) AS score
-FROM cached_question_answer
-ORDER BY embedding <=> $1::vector
-LIMIT $2;
-
-
-embedding <=> $1 is the cosine distance
-
-1 - distance → similarity score in [0,1] for your Python dicts
-
-This pattern is exactly how pgvector docs show using HNSW with cosine distance. 
-GitHub
-+1
-
-5️⃣ Optional: ANALYZE + runtime tuning
-
-After you bulk insert your top 100 Q/As:
-
-ANALYZE cached_question_answer;
-
-
-If you ever want better recall at the cost of speed, at session level:
-
-SET hnsw.ef_search = 100;  -- default 40, higher = better recall, slower
-
-
-(You can also SET LOCAL hnsw.ef_search = 100 inside a transaction for one query.) 
-GitHub
-
-If you paste your current Python base_sql for search_internal_answers_async I can double-check that the column name (embedding) and dimension (vector(1024)) line up perfectly with this DDL so you don’t hit any “column does not have dimensions” or type mismatch errors.
