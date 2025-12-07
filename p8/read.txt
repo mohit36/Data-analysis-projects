@@ -1,274 +1,74 @@
-Perfect, I can read this file from the screenshots – no need to resend these parts. Let me quickly sanity-check what you have and where it plugs in, so you’re not lost about “what goes where”.
+async def process_query_with_context(
+    query: str,
+    history: List[Dict[str, str]],
+    relevance_threshold: float = RELEVANCE_THRESHOLD,
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    Main controller for query → (possibly rewritten query, metadata).
 
-### What’s already in `context_aware_query_processor.py` (from your screenshots)
+    Returns:
+        processed_query: str (may be same as input)
+        meta: {
+            "needs_clarification": bool,
+            "clarification_question": Optional[str],
+            "query_form": "standalone|follow_up|under_specified",
+        }
+    """
+    meta: Dict[str, Any] = {
+        "needs_clarification": False,
+        "clarification_question": None,
+        "query_form": None,
+    }
 
-You currently have:
+    # 1) Classify query form (standalone / follow_up / under_specified)
+    query_form = await classify_query_form(query)
+    meta["query_form"] = query_form
 
-1. **Imports + config**
+    # 1.b) SPECIAL CASE: generic “what services do you provide” style questions
+    # These should NEVER go to clarification – they should be treated as
+    # standalone service-overview questions and answered directly.
+    #
+    # We intentionally ignore intent here (pass None) so the pattern
+    # matcher only looks at the text.
+    if is_generic_services_question(query, intent=None):
+        logger.info(
+            "Detected generic services overview question – "
+            "forcing query_form='standalone' and skipping clarification."
+        )
+        query_form = "standalone"
+        meta["query_form"] = query_form
 
-   * `SentenceTransformer` with `EMBEDDING_MODEL = "thenlper/gte-large"`
-   * `RELEVANCE_THRESHOLD = 0.70`
-   * `MAX_HISTORY_PAIRS = 3`
-   * Azure Chat config using `AZURE_CHAT_DEPLOYMENT` (your `gpt-4.1-mini`).
+    # 2) Filter history by relevance (semantic similarity + recency)
+    filtered_history = filter_history_by_relevance(
+        history=history,
+        query=query,
+        threshold=relevance_threshold,
+    )
 
-2. **Prompts imported from `prompt_list.py`**
+    # 3) Under-specified → clarification only
+    # (This will NOT run for generic services questions because we forced
+    #  query_form to 'standalone' above.)
+    if query_form == "under_specified":
+        clar_q = await generate_underspecified_clarification(query)
+        meta["needs_clarification"] = True
+        meta["clarification_question"] = clar_q
+        return query, meta
 
-   ```python
-   from prompt_list import (
-       main_intent_classifier,              # intent classification
-       query_type_classification_prompt,    # standalone / follow_up / under_specified
-       query_decontextualization_prompt,    # uses HISTORY
-       query_rewrite_no_history_prompt,     # rewrite with NO history
-       clarification_underspecified_prompt, # “this is too vague” clarifier
-       clarification_followup_prompt,       # “you’re referring to earlier context” clarifier
-   )
-   ```
+    # 4) Follow-up → needs history (if any)
+    if query_form == "follow_up":
+        if filtered_history:
+            # Use LLM prompt that incorporates only relevant history
+            rewritten = await decontextualize_query_with_history(
+                query, filtered_history
+            )
+            return rewritten, meta
+        else:
+            # We *should* have history but don't – ask the user to clarify
+            clar_q = await generate_followup_clarification(query)
+            meta["needs_clarification"] = True
+            meta["clarification_question"] = clar_q
+            return query, meta
 
-3. **LLM helper**
-
-   ```python
-   async def _call_llm_zero_temp(prompt: str, max_tokens: int = 256) -> str:
-       resp = await openai.ChatCompletion.acreate(
-           engine=DEPLOYMENT_NAME,
-           messages=[{"role": "user", "content": prompt}],
-           temperature=0,
-           max_tokens=max_tokens,
-       )
-       return resp["choices"][0]["message"]["content"].strip()
-   ```
-
-4. **Query-form classifier**
-
-   ```python
-   async def classify_query_form(query: str) -> str:
-       # returns "standalone" | "follow_up" | "under_specified"
-       prompt = query_type_classification_prompt.replace("{query}", query)
-       raw = await _call_llm_zero_temp(prompt, max_tokens=8)
-       ...
-   ```
-
-5. **History → text**
-
-   ```python
-   def _history_to_text(history: list[dict]) -> str:
-       # last few exchanges, formatted as:
-       # "User: ...\nAssistant: ..."
-   ```
-
-6. **Decontextualizer with history**
-
-   ```python
-   async def decontextualize_query_with_history(query: str, history: list[dict]) -> str:
-       history_text = _history_to_text(history)
-       prompt = (
-           query_decontextualization_prompt
-               .replace("{history}", history_text)
-               .replace("{query}", query)
-       )
-       rewritten = await _call_llm_zero_temp(prompt, max_tokens=128)
-       return rewritten.strip()
-   ```
-
-7. **Services-overview detector (your “never ask clarification” hack)**
-
-   ```python
-   def is_services_overview_query(text: str) -> bool:
-       patterns = [
-           "what are the services provided",
-           "what are the services you provide",
-           "what services do you offer",
-           "what services do you provide",
-           "what services does exigotech provide",
-           "tell me about your services",
-           "what are your services",
-           "what are your core offerings",
-           "what solutions do you provide",
-           "what solutions do you offer",
-           "what are the solutions you provide",
-       ]
-       ...
-       return any(p in t for p in patterns)
-   ```
-
-8. **Rewrite with no history**
-
-   ```python
-   async def rewrite_query_no_history(query: str) -> str:
-       prompt = query_rewrite_no_history_prompt.replace("{query}", query)
-       rewritten = await _call_llm_zero_temp(prompt, max_tokens=128)
-       return rewritten.strip()
-   ```
-
-9. **History relevance filter (embedding-based)**
-
-   ```python
-   def filter_history_by_relevance(history, query, threshold=RELEVANCE_THRESHOLD):
-       if not history:
-           return []
-       recent_history = history[-10:]
-       relevant_history = []
-       i = 0
-       while i < len(recent_history) - 1:
-           user_msg = recent_history[i].get("content", "")
-           asst_msg = recent_history[i+1].get("content", "") if i+1 < len(recent_history) else ""
-           turn_text = f"{user_msg} {asst_msg}"
-           similarity = compute_semantic_similarity_cached(query, turn_text)
-           if similarity >= threshold:
-               relevant_history.extend([recent_history[i], recent_history[i+1]])
-               if len(relevant_history)//2 > MAX_HISTORY_PAIRS:
-                   break
-           i += 2
-       logger.info(f"✅ Filtered history: {len(relevant_history)}/{len(recent_history)} messages")
-       return relevant_history
-   ```
-
-10. **(Optional) classify_query_type_llm** – pure LLM fallback; fine to keep but we’re mostly using the explicit `classify_query_form`.
-
----
-
-### Where this module is used
-
-This is the wiring you should already have (or add) in **`chatbot_agents/chatbot_search_new.py`**:
-
-1. **Imports near top of file**
-
-   ```python
-   from helper.context_aware_query_processor import (
-       classify_query_form,
-       decontextualize_query_with_history,
-       rewrite_query_no_history,
-       is_services_overview_query,
-       filter_history_by_relevance,
-   )
-   ```
-
-2. **Inside `contextualize_query(...)` (or equivalent)**
-
-   Replace any old “query type classification + history handling” with this logic:
-
-   ```python
-   async def contextualize_query(query: str, history: list[dict]) -> tuple[str, dict]:
-       """
-       Decide how to treat the query:
-       - standalone: just clean it
-       - follow_up: decontextualize with *relevant* history
-       - under_specified: ask clarification
-       Returns: (final_query, metadata)
-       """
-       original = query
-       lower_q = query.lower().strip()
-
-       # 1) Hard-coded *no-clarification* path for generic service questions
-       if is_services_overview_query(lower_q):
-           cleaned = await rewrite_query_no_history(original)
-           return cleaned, {
-               "query_type": "standalone",
-               "used_history": False,
-               "reason": "services_overview_shortcircuit",
-           }
-
-       # 2) Classify query form
-       form = await classify_query_form(original)  # "standalone"|"follow_up"|"under_specified"
-
-       # 3) Under-specified → clarification (no vector search)
-       if form == "under_specified":
-           # use clarification_underspecified_prompt in exigotech_chatbot,
-           # or wherever you generate the clarifying question
-           return original, {
-               "query_type": "under_specified",
-               "needs_clarification": True,
-               "reason": "too_vague_for_safe_answer",
-           }
-
-       # 4) Standalone → clean only
-       if form == "standalone":
-           cleaned = await rewrite_query_no_history(original)
-           return cleaned, {
-               "query_type": "standalone",
-               "used_history": False,
-               "reason": "standalone_no_history",
-           }
-
-       # 5) Follow-up → filter history then decontextualize
-       relevant_history = filter_history_by_relevance(history, original)
-       if not relevant_history:
-           # no relevant turns found → treat as standalone
-           cleaned = await rewrite_query_no_history(original)
-           return cleaned, {
-               "query_type": "follow_up_no_relevant_history",
-               "used_history": False,
-               "reason": "no_relevant_history",
-           }
-
-       rewritten = await decontextualize_query_with_history(original, relevant_history)
-       return rewritten, {
-           "query_type": "follow_up",
-           "used_history": True,
-           "history_len": len(relevant_history),
-           "reason": "follow_up_with_relevant_history",
-       }
-   ```
-
-3. **Inside `hybrid_query_search(...)`**
-
-   Near the top, where you previously did:
-
-   ```python
-   processed_query = query
-   # maybe some old contextualization logic...
-   ```
-
-   Replace with:
-
-   ```python
-   processed_query, q_meta = await contextualize_query(query, history or [])
-   logger.info(
-       "Contextualized query",
-       extra={"service": "search", "original": query, "processed": processed_query, "meta": q_meta},
-   )
-
-   if q_meta.get("needs_clarification"):
-       # Don’t call vector search; just bubble this up
-       return processed_query, [], {
-           "needs_clarification": True,
-           "clarification_question": processed_query,
-           "contextualization_meta": q_meta,
-       }
-   ```
-
-   and then keep the rest of your vector search + reranking flow unchanged.
-
----
-
-### What this gives you (in plain language)
-
-* **Your “services” questions *never* ask for clarification**
-  Anything matching those patterns goes straight to:
-
-  * `rewrite_query_no_history` (LLM cleans it for search)
-  * Vector search → `generate_exigotech_answer` → UI.
-
-* **History is only used when:**
-
-  * `classify_query_form` says “follow_up” **and**
-  * `filter_history_by_relevance` finds at least one relevant turn.
-
-* **If query is too vague:**
-  It short-circuits before search and returns a clarifying question. That’s what you want for things like “Tell me more” without context.
-
----
-
-### What you need to do now
-
-Given the code you showed, you **already** have most of the helper module right. To be fully wired:
-
-1. Check `chatbot_agents/chatbot_search_new.py`:
-
-   * Confirm those 5 imports from `context_aware_query_processor` exist.
-   * Replace any old “query type” logic with the `contextualize_query()` pattern above.
-   * Make sure `hybrid_query_search()` uses `q_meta["needs_clarification"]` exactly as in your current `chatbot_api.py`.
-
-2. Nothing else needed inside `context_aware_query_processor.py` itself based on these screenshots.
-   If batch-2 shows another section, I’ll map it similarly, but this foundation is already correct.
-
-If you want, next concrete thing we can do is: you paste (or screenshot) just the top of `hybrid_query_search` (from its `def` line down to before it calls Qdrant), and I’ll mark the exact before/after blocks there.
+    # 5) Standalone → no history, just clean up the query
+    rewritten = await rewrite_query_no_history(query)
+    return rewritten, meta
