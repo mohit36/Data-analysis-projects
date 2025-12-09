@@ -845,12 +845,258 @@ What this gives you now
 ⸻
 
 If you paste in the new helper file and apply the two small changes in chatbot_search_new.py, test with:
-	•	“what are the services provided”
-	•	“what are your core offerings”
-	•	“who is the CEO”
-	•	“what is your mission”
-	•	“how many awards did you win in 2025”
+fine-tune tokens and caching tomorrow.
 
-and send me the new terminal logs + UI screenshots if anything still feels off.
 
-For now: save, restart the API + UI, go sleep, make your wife happy. We can fine-tune tokens and caching tomorrow.
+
+# ============================================================
+# CHANGE 1 — async_search_local_pgvector: REMOVE URL DEDUPE
+# ============================================================
+
+# OLD (end of async_search_local_pgvector, AFTER reranking)
+# --------------------------------------------------------
+# results = reranked_results or raw_results
+
+    # Deduplicate by URL (keep highest scoring result per URL)
+    url_to_result = {}
+    for r in results:
+        raw_url = r.get("url")
+        if raw_url:
+            key = canonicalize_url(raw_url)
+        else:
+            # fallback synthetic key for items without a public URL
+            key = f"internal://{r.get('page_title','unknown')}#{r.get('chunk_index',0)}"
+
+        try:
+            score_val = float(r.get("score", 0.0))
+        except Exception:
+            score_val = 0.0
+
+        if key not in url_to_result or score_val > float(url_to_result[key].get("score", 0.0)):
+            url_to_result[key] = r
+
+    # sort by score (descending) and take top_k
+    unique_links = sorted(
+        url_to_result.values(),
+        key=lambda x: float(x.get("score", 0.0)),
+        reverse=True
+    )
+
+    threshold = 0.5
+    filtered_links = [r for r in unique_links if r["score"] >= threshold]
+
+    if not filtered_links:
+        if unique_links:
+            best_score = unique_links[0]["score"]
+            logger.warning(
+                f"⚠️ No results above threshold >= {threshold:.2f} (best: {best_score:.3f}). "
+                "Returning best available results"
+            )
+            return unique_links[:top_k]
+        else:
+            logger.error("❌ Search failed: No results from vector search")
+            return []
+
+    return filtered_links[:top_k]
+
+
+# NEW (no dedupe here — keep ALL ranked chunks for stage 1)
+# ---------------------------------------------------------
+# results = reranked_results or raw_results
+
+    # Do NOT deduplicate by URL anymore.
+    # We want multiple chunks per page, then a separate step will:
+    #   - choose top URLs
+    #   - expand each URL to all its chunks.
+    unique_links = sorted(
+        results,
+        key=lambda x: float(x.get("score", 0.0)),
+        reverse=True
+    )
+
+    threshold = 0.5
+    filtered_links = [r for r in unique_links if r["score"] >= threshold]
+
+    if not filtered_links:
+        if unique_links:
+            best_score = unique_links[0]["score"]
+            logger.warning(
+                f"⚠️ No results above threshold >= {threshold:.2f} (best: {best_score:.3f}). "
+                "Returning best available results"
+            )
+            return unique_links[:top_k]
+        else:
+            logger.error("❌ Search failed: No results from vector search")
+            return []
+
+    return filtered_links[:top_k]
+
+
+# ============================================================
+# CHANGE 2 — NEW HELPER: SEARCH + PAGE EXPANSION BY URL
+# ============================================================
+
+# OLD: (no helper, callers used async_search_local_pgvector directly)
+# -------------------------------------------------------------------
+# results, quality = await async_search_local_pgvector(
+#     client_conn=client_conn,
+#     query_vector=query_vector,
+#     top_k=top_k,
+#     source_type=source_type,
+#     collection_name=collection_name,
+#     query_text=query_text,
+#     use_reranking=True,
+# )
+# # 'results' = chunk-level, passed straight to LLM
+
+
+# NEW: ADD THIS HELPER (same file or a small utils module)
+# --------------------------------------------------------
+from collections import defaultdict
+
+async def search_and_expand_pages(
+    client_conn,
+    query_vector,
+    collection_name: str,
+    query_text: str,
+    top_k_pages: int = 3,
+    max_chunks_per_page: int = 15,
+) -> tuple[list[dict], dict]:
+    """
+    Stage 1: chunk-level vector search + rerank → pick best URLs (pages).
+    Stage 2: for each chosen URL, fetch ALL its chunks from Postgres ordered by chunk_index.
+    Returns: (expanded_chunks, quality_meta)
+    """
+    # -------------- Stage 1: normal vector search (chunk-level) -------------
+    chunk_results, quality_meta = await async_search_local_pgvector(
+        client_conn=client_conn,
+        query_vector=query_vector,
+        top_k=50,                      # a bit higher to have enough candidates
+        source_type=None,              # or whatever you already pass
+        collection_name=collection_name,
+        query_text=query_text,
+        use_reranking=True,
+    )
+
+    if not chunk_results:
+        return [], quality_meta
+
+    # -------------- Stage 1.5: group by URL & score pages -------------------
+    url_to_chunks: dict[str, list[dict]] = defaultdict(list)
+    for r in chunk_results:
+        url = r.get("url")
+        if not url:
+            continue
+        url_to_chunks[url].append(r)
+
+    # Score per URL: best chunk score (you can change to avg of top 3)
+    url_scores: list[tuple[str, float]] = []
+    for url, items in url_to_chunks.items():
+        try:
+            best_score = max(float(c.get("score", 0.0)) for c in items)
+        except ValueError:
+            best_score = 0.0
+        url_scores.append((url, best_score))
+
+    # Sort URLs by score desc and keep top_k_pages
+    url_scores.sort(key=lambda t: t[1], reverse=True)
+    top_urls = [u for (u, _) in url_scores[:top_k_pages]]
+
+    if not top_urls:
+        return [], quality_meta
+
+    # -------------- Stage 2: expand each URL to all its chunks --------------
+    expanded_chunks: list[dict] = []
+
+    # NOTE: table name from your screenshot: website_chunks_ultra_v1_au
+    # If you parameterise by country, adjust table name accordingly outside.
+    sql = """
+        SELECT
+            url,
+            page_title,
+            slug,
+            chunk_index,
+            text,
+            source_type
+        FROM website_chunks_ultra_v1_au
+        WHERE url = $1
+        ORDER BY chunk_index ASC
+        LIMIT $2;
+    """
+
+    for url in top_urls:
+        rows = await client_conn.fetch(sql, url, max_chunks_per_page)
+        for row in rows:
+            expanded_chunks.append(
+                {
+                    "url": row["url"],
+                    "page_title": row["page_title"],
+                    "slug": row["slug"],
+                    "chunk_index": row["chunk_index"],
+                    "text": row["text"],
+                    "source_type": row["source_type"],
+                    # keep the page-level score if needed
+                    "page_score": next(
+                        (score for (u, score) in url_scores if u == url), 0.0
+                    ),
+                }
+            )
+
+    return expanded_chunks, quality_meta
+
+
+# ============================================================
+# CHANGE 3 — CALL SITE: USE PAGE-EXPANSION HELPER
+# ============================================================
+
+# OLD (inside your agent / hybrid_query_search / generate_answer pipeline)
+# ------------------------------------------------------------------------
+# results, quality_meta = await async_search_local_pgvector(
+#     client_conn=client_conn,
+#     query_vector=query_vector,
+#     top_k=top_k,
+#     source_type=source_type,
+#     collection_name=collection_name,
+#     query_text=query_text,
+#     use_reranking=True,
+# )
+#
+# # results (chunk-level) passed straight into LLM prompt:
+# answer = await generate_answer_from_chunks(results, user_query, prompt_config)
+
+
+# NEW
+# ------------------------------------------------------------------------
+page_chunks, quality_meta = await search_and_expand_pages(
+    client_conn=client_conn,
+    query_vector=query_vector,
+    collection_name=collection_name,
+    query_text=query_text,
+    top_k_pages=3,            # or 5, depending on how many services you want
+    max_chunks_per_page=15,   # cap per page to keep tokens under control
+)
+
+# Now pass *page-level* chunks (all chunk_index per selected URL) to your LLM:
+answer = await generate_answer_from_chunks(page_chunks, user_query, prompt_config)
+
+
+# ============================================================
+# CHANGE 4 — CENTRAL SLUG HELPER (IF YOU DON'T HAVE ONE YET)
+# ============================================================
+
+# OLD: slug computed ad-hoc in multiple places (or not centralised).
+# ---------------------------------------------------------------
+
+# NEW: single helper, reuse everywhere (ingestion + DB + prompt)
+# ---------------------------------------------------------------
+from urllib.parse import urlparse
+
+def make_slug(url: str) -> str:
+    """
+    Slug = last non-empty path segment.
+    e.g., https://example.com/services/exservice → "exservice"
+    """
+    path = urlparse(url).path
+    parts = [p for p in path.split("/") if p]
+    return parts[-1] if parts else ""
+
