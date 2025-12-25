@@ -1,36 +1,50 @@
-I've analyzed the results from your VS Code agent and the screenshot you shared. Your agent is accurately interpreting the GPT-5 hierarchy (Nano for logic, Mini for synthesis), which is impressive since these models were only recently unified in the August 2025 release.
+Copy and paste this entire block to your VS Code agent. This covers the Intent (with confidence) and Parallel Search logic while stripping out all the legacy/history clutter.
 
-Here is the "brutally honest" review of how you’re doing with the project and specific feedback on the agent's current output.
+Developer Task: Refactor for Intent Precision and Parallel Retrieval
+Goal: Optimize latency and accuracy by decoupling intent from search, using speculative parallel execution, and implementing a rerank "Score Gate."
 
-The Project Review: You’re Building a "Neural" Engine
-Most developers are still building "Linear RAG" (Query -> Search -> Answer). You are building a Decision-Based Engine.
+1. Intent Classifier Upgrade (query_processor.py)
+Action: Refactor classify_intent_llm to use GPT-5 Nano.
 
-The Win: By separating Classification from Intent, you’re creating a system that can "admit" it doesn't know something (Clarification Path) instead of just hallucinating.
+Requirement: Change the prompt to strictly return JSON: {"intent": "string", "confidence": float, "reasoning": "string"}.
 
-The Risk: You are now at the "Complexity Threshold." Every new layer you add increases the chance of a Logic Loop. If GPT-5 Nano misclassifies even 10% of queries, your whole parallel pipeline wastes tokens and time.
+Logic: Ensure confidence is a float (0.0 to 1.0).
 
-Feedback on Your Agent's Results
-Looking at your screenshot and the implementation:
+Cleanup: Delete all old logic that returns raw strings or simple text fallbacks.
 
-Intent Mapping Logic: I see your agent is mapping the intent to source_type. Check this: Make sure the agent hasn't hardcoded the intent names. If you add a new service to your Postgres DB tomorrow, the agent shouldn't need a code change. It should pull intent names dynamically from your DB schema if possible.
+2. Orchestrator "Race Track" Start (query_processor.py)
+Action: Refactor the start of process_query_with_context.
 
-The Parallel Implementation: Ensure the agent is using asyncio.gather correctly. If it’s just calling them one after another with await, you aren't actually saving any time. You should see a "waterfall" effect in your logs where all three calls start at the same millisecond.
+Logic: Use asyncio.gather to fire classify_query_form() and classify_intent_llm() simultaneously.
 
-The "Gap" Logic: Your agent seems to understand the 0.15 threshold. Observation: In the screenshot, I noticed a vector score of 0.91. If your second result is 0.88, the agent must trigger Cohere. Make sure it isn't just looking at the top score in isolation.
+Short-Circuit: If the classification task returns 'UNDER_SPECIFIED', immediately .cancel() the intent task and return the clarification prompt.
 
-Optimized Technical Instructions for Your Agent
-Since you are using GPT-5 Mini for your VS Code agent, it can handle very complex "System 2" reasoning. Give it these specific refinements tomorrow morning:
+Wiring: Pass the intent and confidence float directly into the search module.
 
-Task 1: The "Smart" Parallel Start
-"Refactor the orchestrator. Launch classify_query(), detect_intent(), and fetch_rolling_context() in a single asyncio.gather. If classify_query returns 'Under-specified', use task.cancel() on the other two immediately to save tokens and latency."
+3. Speculative Dual-Search (search.py)
+Action: Refactor async_search_local_pgvector to use the confidence score.
 
-Task 2: The "Gap" Implementation
-"In the retrieval module, after the PGVector search, calculate diff = top_scores[0] - top_scores[1]. If top_scores[0] > 0.90 AND diff > 0.15, bypass the Cohere Reranker and pass the top 3 chunks directly to the synthesis prompt. Otherwise, send top 10 to Cohere."
+Logic: * If confidence < 0.95: Run two searches in parallel using asyncio.gather: 1. Primary Search: Filtered by source_type mapping to the intent. 2. General Search: Unfiltered search across the entire table.
 
-Task 3: Rolling Summary Update
-"Create a post-process function that takes the final LLM response and the user query, and sends them to GPT-5 Nano to update the 'Session State' JSON in Postgres. The state must be a concise summary + list of detected entities."
+If confidence >= 0.95: Only run the Primary Search.
 
-The Next Level: Speculative Synthesis
-If you want to be truly high-level, tell your agent to try Speculative Synthesis. While the reranker is running, have GPT-5 Mini start generating a "General" response. If the reranker confirms the results are high-quality, swap in the specific data. This is how you get sub-1-second "perceived" latency.
+Merge: Deduplicate results using chunk_id before proceeding.
 
-Would you like me to write the specific "Session State" JSON schema for your Postgres DB so the agent knows exactly how to structure the memory?
+4. The "Score Gate" Rerank Bypass (search.py)
+Action: Add a logic gate before the Cohere rerank() call.
+
+Calculation: Get the scores for the Top 2 results from the vector search. Calculate gap = top_1_score - top_2_score.
+
+Condition: If top_1_score > 0.90 AND gap > 0.15:
+
+Skip Cohere: Do not call the reranker API. Return the top 3 results directly.
+
+Else: Proceed to the standard Cohere reranking of the top 10 results.
+
+Cleanup: Remove any legacy sequential fallback logic.
+
+Testing Instructions for you:
+
+Check your logs after a clear query. You should see "Bypassing reranker" if the vector search was strong.
+
+Check the timestamp of your LLM calls. Both classify and intent should start at the exact same millisecond.
