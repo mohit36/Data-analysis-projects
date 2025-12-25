@@ -1,50 +1,62 @@
-Copy and paste this entire block to your VS Code agent. This covers the Intent (with confidence) and Parallel Search logic while stripping out all the legacy/history clutter.
+Your logic is solid—this is essentially a **High-Performance Speculative RAG** architecture. You are moving from a "Standard RAG" (which is slow and dumb) to an **"Intent-Aware Neural Engine."**
 
-Developer Task: Refactor for Intent Precision and Parallel Retrieval
-Goal: Optimize latency and accuracy by decoupling intent from search, using speculative parallel execution, and implementing a rerank "Score Gate."
+To ensure your agent doesn't turn this into a "spaghetti mess," here is your final **Code Audit Checklist**. If the code doesn't meet these 4 points, the agent has failed and you must make it redo the work.
 
-1. Intent Classifier Upgrade (query_processor.py)
-Action: Refactor classify_intent_llm to use GPT-5 Nano.
+---
 
-Requirement: Change the prompt to strictly return JSON: {"intent": "string", "confidence": float, "reasoning": "string"}.
+### **1. The "JSON vs String" Audit**
 
-Logic: Ensure confidence is a float (0.0 to 1.0).
+**What to look for:** Look at the return value of `classify_intent_llm`.
 
-Cleanup: Delete all old logic that returns raw strings or simple text fallbacks.
+* **BAD:** It returns a string like `"sales"` or has an `if "sales" in response:` block.
+* **GOOD:** It uses `json.loads()` or a Pydantic model. It returns a dictionary.
+* **The Deletion Test:** Search the file for your old intent names (e.g., `"page"`, `"service_info"`). If they still exist as hardcoded strings outside of the new JSON logic, **delete them.**
 
-2. Orchestrator "Race Track" Start (query_processor.py)
-Action: Refactor the start of process_query_with_context.
+### **2. The "Parallel Start" Audit**
 
-Logic: Use asyncio.gather to fire classify_query_form() and classify_intent_llm() simultaneously.
+**What to look for:** Look at the beginning of `process_query_with_context`.
 
-Short-Circuit: If the classification task returns 'UNDER_SPECIFIED', immediately .cancel() the intent task and return the clarification prompt.
+* **BAD:** You see `form = await ...` and then `intent = await ...` on the next line.
+* **GOOD:** You see `await asyncio.gather(task1, task2)`.
+* **The Short-Circuit Test:** Ensure there is an `if classification == "UNDER_SPECIFIED": return ...` **immediately** after the gather. If it still tries to run a database search for a vague query, it's wasting your money.
 
-Wiring: Pass the intent and confidence float directly into the search module.
+### **3. The "Gap Method" Audit (The Latency Killer)**
 
-3. Speculative Dual-Search (search.py)
-Action: Refactor async_search_local_pgvector to use the confidence score.
+**What to look for:** Look at the logic right after your PGVector fetch in `search.py`.
 
-Logic: * If confidence < 0.95: Run two searches in parallel using asyncio.gather: 1. Primary Search: Filtered by source_type mapping to the intent. 2. General Search: Unfiltered search across the entire table.
+* **The Math:** It must calculate `score_1 - score_2`.
+* **The Logic:** If the top result is a "runaway winner" (e.g., `0.94` vs `0.70`), the agent **must not** call Cohere.
+* **Spaghetti Check:** Make sure the agent didn't leave a "default" rerank call at the end that runs regardless of the bypass.
 
-If confidence >= 0.95: Only run the Primary Search.
+### **4. The "Speculative Search" Audit**
 
-Merge: Deduplicate results using chunk_id before proceeding.
+**What to look for:** Look at the database query in `search.py`.
 
-4. The "Score Gate" Rerank Bypass (search.py)
-Action: Add a logic gate before the Cohere rerank() call.
+* **Logic:** If `confidence < 0.95`, are there **two** distinct database calls happening in an `asyncio.gather`?
+1. `source_type` filtered search (Primary).
+2. No-filter search (General Fallback).
 
-Calculation: Get the scores for the Top 2 results from the vector search. Calculate gap = top_1_score - top_2_score.
 
-Condition: If top_1_score > 0.90 AND gap > 0.15:
+* **The Clean-up:** Ensure the results are merged using a **Set** or **Dictionary** keyed by `chunk_id` so you don't send duplicate data to the LLM.
 
-Skip Cohere: Do not call the reranker API. Return the top 3 results directly.
+---
 
-Else: Proceed to the standard Cohere reranking of the top 10 results.
+### **Final "Strict" Prompt for your Agent (Task 1)**
 
-Cleanup: Remove any legacy sequential fallback logic.
+If you are about to start, use this exact prompt to ensure the agent is "Strict" enough:
 
-Testing Instructions for you:
+> "Refactor `classify_intent_llm`.
+> 1. Use **GPT-5 Nano** with a system prompt that permits ONLY raw JSON output.
+> 2. **JSON Schema:** `{"intent": "string", "confidence": float}`.
+> 3. **Brutal Deletion:** Identify the old code that returns a string and **delete it entirely.** Do not comment it out. I want the function to fail if the JSON is not valid.
+> 4. **Confidence Rubric:** Force the model to use 1.0 for exact matches, 0.7 for vague keywords, and 0.1 for greetings."
+> 
+> 
 
-Check your logs after a clear query. You should see "Bypassing reranker" if the vector search was strong.
+---
 
-Check the timestamp of your LLM calls. Both classify and intent should start at the exact same millisecond.
+### **Is it fine?**
+
+**Yes.** This logic is excellent because it treats **LLM calls as expensive and slow** and **Code logic as cheap and fast.** **My advice:** Don't let the agent do "Micro-Task 2" (Parallel Start) until you have seen the code for "Micro-Task 1" and verified it's clean. If you try to do all 4 at once, GPT-5 Mini will get confused and give you spaghetti.
+
+**Would you like me to review the specific Python code for the "Score Gate" math before you give it to the agent?**
